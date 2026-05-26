@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Customer Tracking — Local Dev</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --fg: #1a1a1a; --muted: #666; --line: #eaeaea; --bg-soft: #f7f7f8; --accent: #0a7d33; }
+    * { box-sizing: border-box; }
+    body { font: 14px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; max-width: 1100px; margin: 32px auto; padding: 0 16px; color: var(--fg); }
+    h1 { margin: 0 0 4px; font-size: 24px; }
+    .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+    @media (max-width: 700px) { .row { grid-template-columns: repeat(2, 1fr); } }
+    .card { background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+    .card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+    th { background: #fafafa; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    h2 { font-size: 15px; margin: 32px 0 8px; color: #333; text-transform: uppercase; letter-spacing: .05em; }
+    .controls { margin: 12px 0; }
+    select { padding: 6px 8px; border-radius: 6px; border: 1px solid #ddd; font: inherit; background: white; }
+    canvas { max-height: 320px; }
+    .empty { color: var(--muted); padding: 24px; text-align: center; background: var(--bg-soft); border-radius: 10px; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: middle; animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    button { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid #ccc; background: white; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    button.danger { color: #b03030; border-color: #e0b0b0; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge.emp { background: #fef3c7; color: #92400e; }
+    .badge.cust { background: #dcfce7; color: #166534; }
+    tr.is-emp td { background: #fffbeb; }
+  </style>
+</head>
+<body>
+  <h1>Customer Tracking</h1>
+  <div class="subtitle"><span class="dot"></span>Local dev — auto-refreshes every 5s</div>
+
+  <h2>Today (entry-line counting — primary metric)</h2>
+  <div id="entry-stats" class="row"></div>
+
+  <h2>All-time</h2>
+  <div id="stats" class="row"></div>
+
+  <h2>Visits (Phase 4 — session logic)</h2>
+  <div id="visit-stats" class="row"></div>
+  <table id="visits">
+    <thead><tr><th>Visit</th><th>Person</th><th>Store</th><th>Started</th><th>Duration</th><th>Detections</th><th>Cameras</th><th>Returning?</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Persons (cross-camera, re-ID)</h2>
+  <table id="persons">
+    <thead><tr><th>Person ID</th><th>Status</th><th>First seen</th><th>Last seen</th><th>First store · camera</th><th>Cameras</th><th>Samples</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Counts over time</h2>
+  <div class="controls">
+    <label>Bucket:
+      <select id="bucket">
+        <option value="minute">Per minute</option>
+        <option value="hour" selected>Per hour</option>
+        <option value="day">Per day</option>
+      </select>
+    </label>
+  </div>
+  <canvas id="chart"></canvas>
+
+  <h2>By store</h2>
+  <table id="by-store">
+    <thead><tr><th>Store</th><th>Unique people</th><th>Total detections</th><th>Cameras</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Export (CSV)</h2>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+    For cross-referencing with POS data externally. <code>daily_summary.csv</code> is the right grain for conversion-rate analysis.
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:24px">
+    <a href="/api/export/daily_summary.csv" download><button>Daily summary</button></a>
+    <a href="/api/export/entries.csv" download><button>All entry events</button></a>
+    <a href="/api/export/visits.csv" download><button>All visits</button></a>
+    <span style="color:var(--muted);font-size:12px;margin-left:12px">
+      Filter by date or store: append <code>?since=YYYY-MM-DD</code> and/or <code>?store_id=store-01</code> to the URL.
+    </span>
+  </div>
+
+  <h2>Settings (tunable)</h2>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+    Changes take effect on the NEXT pipeline run (and immediately for compute_visits.py reruns). Tune as you measure accuracy. Click "reset" to clear an override and return to the default.
+  </div>
+  <table id="settings">
+    <thead><tr><th>Setting</th><th>Value</th><th>Default · Range</th><th>What it does</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <script>
+    let chart = null;
+    const fmtTs = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '—';
+
+    async function loadEntryStats() {
+      const r = await fetch('/api/entry_stats?scope=today');
+      const d = await r.json();
+      const el = document.getElementById('entry-stats');
+      if (d.error) {
+        el.innerHTML = `<div class="empty" style="grid-column:1/-1">${d.error}<br><span style="font-size:12px">Set ENTRY_LINE env var (use scripts/pick_entry_line.py to get the coords) when running the pipeline.</span></div>`;
+        return;
+      }
+      el.innerHTML = `
+        <div class="card"><div class="label">Unique customers today</div><div class="value">${d.unique_customers ?? 0}</div></div>
+        <div class="card"><div class="label">Customer door crossings IN</div><div class="value">${d.customer_crossings_in ?? 0}</div></div>
+        <div class="card"><div class="label">Employee crossings IN</div><div class="value">${d.employee_crossings_in ?? 0}</div></div>
+        <div class="card"><div class="label">Total OUT crossings</div><div class="value">${d.total_crossings_out ?? 0}</div></div>
+      `;
+    }
+
+    async function loadStats() {
+      const r = await fetch('/api/stats');
+      const d = await r.json();
+      const el = document.getElementById('stats');
+      if (d.error) { el.innerHTML = `<div class="empty" style="grid-column:1/-1">${d.error}</div>`; return; }
+      const personsVal = d.unique_persons != null
+        ? `${d.unique_persons}`
+        : `<span style="color:#888;font-size:14px">re-ID off</span>`;
+      const empCount = d.employees_count ?? 0;
+      const custPersons = d.customer_persons ?? d.unique_persons;
+      el.innerHTML = `
+        <div class="card"><div class="label">Customer persons</div><div class="value">${custPersons ?? 0}</div></div>
+        <div class="card"><div class="label">Employees tagged</div><div class="value">${empCount}</div></div>
+        <div class="card"><div class="label">Total unique persons</div><div class="value">${personsVal}</div></div>
+        <div class="card"><div class="label">Stores · cameras</div><div class="value">${d.stores ?? 0} · ${d.cameras ?? 0}</div></div>
+      `;
+    }
+
+    async function loadByStore() {
+      const r = await fetch('/api/by_store');
+      const rows = await r.json();
+      document.querySelector('#by-store tbody').innerHTML =
+        rows.length
+          ? rows.map(s => `<tr><td>${s.store_id}</td><td>${s.unique_tracks}</td><td>${s.total_detections}</td><td>${s.cameras}</td></tr>`).join('')
+          : '<tr><td colspan="4" class="empty">No data yet</td></tr>';
+    }
+
+    async function loadVisitStats() {
+      const r = await fetch('/api/visit_stats');
+      const d = await r.json();
+      const el = document.getElementById('visit-stats');
+      if (d.error) {
+        el.innerHTML = `<div class="empty" style="grid-column:1/-1">${d.error}</div>`;
+        return;
+      }
+      const cv = d.customer_visits ?? d.total_visits ?? 0;
+      const cuv = d.customer_unique_visitors ?? d.unique_visitors ?? 0;
+      const cret = d.customer_returning_visits ?? d.returning_visits ?? 0;
+      const pctReturning = cv ? Math.round(100 * cret / cv) : 0;
+      const avgDurMin = d.customer_avg_duration_sec ? (d.customer_avg_duration_sec / 60).toFixed(1) : '0';
+      const timeoutMin = d.session_timeout_sec ? Math.round(d.session_timeout_sec / 60) : '—';
+      const empVisits = d.employee_visits ?? 0;
+      el.innerHTML = `
+        <div class="card"><div class="label">Customer visits</div><div class="value">${cv} <span style="font-size:14px;color:#666">(${empVisits} emp)</span></div></div>
+        <div class="card"><div class="label">Unique customers</div><div class="value">${cuv}</div></div>
+        <div class="card"><div class="label">Returning</div><div class="value">${cret} <span style="font-size:14px;color:#666">(${pctReturning}%)</span></div></div>
+        <div class="card"><div class="label">Avg dwell · timeout</div><div class="value" style="font-size:18px">${avgDurMin} min<br><span style="font-size:12px;color:#666">timeout: ${timeoutMin} min</span></div></div>
+      `;
+    }
+
+    async function loadVisits() {
+      const r = await fetch('/api/visits');
+      const rows = await r.json();
+      const fmtDur = (s) => s < 60 ? `${s.toFixed(0)}s` : `${(s / 60).toFixed(1)} min`;
+      document.querySelector('#visits tbody').innerHTML =
+        rows.length
+          ? rows.map(v => `<tr class="${v.is_employee ? 'is-emp' : ''}"><td>V${v.visit_id}</td><td>P${v.person_id}${v.is_employee ? ' <span class="badge emp">EMP</span>' : ''}</td><td>${v.store_id}</td><td>${fmtTs(v.started_ts)}</td><td>${fmtDur(v.duration_sec)}</td><td>${v.n_detections}</td><td>${v.n_cameras}</td><td>${v.is_returning ? 'Yes' : ''}</td></tr>`).join('')
+          : '<tr><td colspan="8" class="empty">No visits computed yet — run: python scripts/compute_visits.py</td></tr>';
+    }
+
+    async function toggleEmployee(personId, isCurrentlyEmployee) {
+      if (isCurrentlyEmployee) {
+        await fetch(`/api/employees/${personId}`, {method: 'DELETE'});
+      } else {
+        const name = prompt(`Enter a name for P${personId} (optional, e.g. "Sarah - Manager"):`, '');
+        if (name === null) return;  // cancelled
+        await fetch('/api/employees', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({person_id: personId, name: name || null, role: null}),
+        });
+      }
+      refresh();
+    }
+
+    async function loadPersons() {
+      const r = await fetch('/api/persons');
+      const rows = await r.json();
+      document.querySelector('#persons tbody').innerHTML =
+        rows.length
+          ? rows.map(p => {
+              const taggedViaLabel = p.tagged_via === 'staff_zone' ? ' · auto (staff zone)'
+                                 : p.tagged_via === 'back_door' ? ' · auto (back door)'
+                                 : p.tagged_via && p.tagged_via !== 'manual' ? ` · auto (${p.tagged_via})`
+                                 : '';
+              const status = p.is_employee
+                ? `<span class="badge emp">Employee${p.employee_name ? ' · ' + p.employee_name : ''}${taggedViaLabel}</span>`
+                : `<span class="badge cust">Customer</span>`;
+              const btnLabel = p.is_employee ? 'Unmark' : 'Mark as employee';
+              const btnClass = p.is_employee ? 'danger' : '';
+              return `<tr class="${p.is_employee ? 'is-emp' : ''}"><td>P${p.person_id}</td><td>${status}</td><td>${fmtTs(p.first_seen_ts)}</td><td>${fmtTs(p.last_seen_ts)}</td><td>${p.first_store} · ${p.first_camera}</td><td>${p.cameras_seen}</td><td>${p.n_samples}</td><td><button class="${btnClass}" onclick="toggleEmployee(${p.person_id}, ${p.is_employee ? 'true' : 'false'})">${btnLabel}</button></td></tr>`;
+            }).join('')
+          : '<tr><td colspan="8" class="empty">No re-ID data yet — run with REID=1</td></tr>';
+    }
+
+    async function loadChart() {
+      const bucket = document.getElementById('bucket').value;
+      const r = await fetch('/api/timeseries?bucket=' + bucket);
+      const rows = await r.json();
+      const ctx = document.getElementById('chart');
+      const data = {
+        labels: rows.map(r => new Date(r.bucket_ts * 1000).toLocaleString()),
+        datasets: [
+          { label: 'Unique people', data: rows.map(r => r.unique_people), borderColor: '#0a7d33', backgroundColor: 'rgba(10,125,51,0.12)', tension: 0.2, fill: true },
+          { label: 'Total detections', data: rows.map(r => r.total_detections), borderColor: '#888', tension: 0.2, hidden: true },
+        ],
+      };
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, { type: 'line', data, options: { responsive: true, maintainAspectRatio: false } });
+    }
+
+    document.getElementById('bucket').addEventListener('change', loadChart);
+    document.querySelector('#by-store thead tr').innerHTML =
+      '<th>Store</th><th>Unique tracks</th><th>Total detections</th><th>Cameras</th>';
+    async function loadSettings() {
+      const r = await fetch('/api/settings');
+      const data = await r.json();
+      const fmtValue = (s) => {
+        if (s.unit === 'seconds') {
+          const v = s.value;
+          if (v >= 86400) return `${(v/86400).toFixed(1)} days`;
+          if (v >= 3600)  return `${(v/3600).toFixed(1)} hours`;
+          if (v >= 60)    return `${(v/60).toFixed(1)} min`;
+          return `${v} s`;
+        }
+        return s.value.toFixed(2);
+      };
+      const html = Object.entries(data).map(([key, s]) => {
+        const stepAttr = s.unit === 'seconds' ? 'step="60"' : 'step="0.01"';
+        const display = fmtValue(s);
+        const isDefault = s.is_default ? '<span style="color:var(--muted);font-size:11px"> (default)</span>' : '';
+        return `<tr>
+          <td><code style="font-size:12px">${key}</code></td>
+          <td>
+            <input type="number" min="${s.min}" max="${s.max}" ${stepAttr} value="${s.value}" id="setting-${key}" style="width:120px;padding:4px 6px;border-radius:6px;border:1px solid #ccc;font:inherit">
+            <button onclick="saveSetting('${key}')">save</button>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px">${display}${isDefault}</div>
+          </td>
+          <td style="font-size:12px;color:var(--muted)">${s.default} <br>[${s.min}, ${s.max}]</td>
+          <td style="font-size:12px">${s.description}</td>
+          <td><button class="${s.is_default ? '' : 'danger'}" onclick="resetSetting('${key}')" ${s.is_default ? 'disabled' : ''}>reset</button></td>
+        </tr>`;
+      }).join('');
+      document.querySelector('#settings tbody').innerHTML = html;
+    }
+
+    async function saveSetting(key) {
+      const v = parseFloat(document.getElementById(`setting-${key}`).value);
+      const r = await fetch(`/api/settings/${key}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: v}),
+      });
+      if (!r.ok) {
+        const err = await r.json();
+        alert(`Failed: ${err.detail || r.status}`);
+      }
+      loadSettings();
+    }
+
+    async function resetSetting(key) {
+      await fetch(`/api/settings/${key}`, {method: 'DELETE'});
+      loadSettings();
+    }
+
+    function refresh() { loadEntryStats(); loadStats(); loadVisitStats(); loadByStore(); loadVisits(); loadPersons(); loadChart(); loadSettings(); }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

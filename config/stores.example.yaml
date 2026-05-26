@@ -1,0 +1,73 @@
+# Copy this to stores.yaml and fill in real values.
+# stores.yaml is gitignored — it holds credentials.
+#
+# Used by scripts/run_multi.py to launch one pipeline subprocess per
+# enabled camera. Each subprocess gets STORE_ID and CAMERA_ID env vars set
+# from this file, so the data lands in the DB tagged correctly.
+
+stores:
+  # ----- A real store -----
+  - id: store-01
+    name: "Anthem Marketplace"
+    enabled: true
+    nvr:
+      host: "192.168.1.108"         # NVR LAN IP (or Tailscale IP later)
+      port: 554
+      username: "admin"
+      password: "REPLACE_ME"
+    cameras:
+      # The front-entrance camera. Watches the door for counting.
+      - name: "entrance"
+        channel: 1
+        stream: "sub"               # "sub" = low-res (recommended for CPU); "main" = 4K
+        enabled: true
+        # Line-crossing entry counter — crossing INWARD = +1 customer visit.
+        # Use scripts/pick_entry_line.py against this camera to get the coords.
+        # Format: "x1,y1,x2,y2,inside_dx,inside_dy"
+        entry_line: "200,400,600,400,0,-1"
+
+      # A camera that sees the boundary into the staff-only area (e.g.
+      # behind the counter, back of the store). One camera can have BOTH
+      # an entry_line and an exclusion_line if it sees both — common when
+      # the entrance camera also sees the counter.
+      #
+      # Crossing the exclusion_line auto-tags that person as an employee.
+      # Customers shouldn't ever cross it; if one does (wanderer, lost
+      # kid), just unmark them in the dashboard.
+      - name: "sales-floor"
+        channel: 2
+        stream: "sub"
+        enabled: false              # turn on per-camera as you're ready
+        # exclusion_line: "100,300,700,300,0,-1"
+
+  # ----- Dev/demo using the sample video instead of a real NVR -----
+  # Flip enabled to true and run `python scripts/run_multi.py` to see two
+  # "cameras" processing the same sample footage in parallel.
+  - id: dev-store
+    name: "Dev (sample video)"
+    enabled: false
+    cameras:
+      - name: "cam-a"
+        source: "sample"            # special token -> data/samples/people-detection.mp4
+        enabled: true
+      - name: "cam-b"
+        source: "sample"
+        enabled: true
+
+  # ----- Pattern for the remaining 7 stores when you're ready -----
+  # Just copy a store block, change id/host/password, list its cameras.
+  # The supervisor will run them all from one process.
+  #
+  # - id: store-02
+  #   name: "..."
+  #   enabled: true
+  #   nvr:
+  #     host: "100.X.Y.Z"          # Tailscale IP at remote stores
+  #     port: 554
+  #     username: "admin"
+  #     password: "..."
+  #   cameras:
+  #     - name: "entrance"
+  #       channel: 1
+  #       stream: "sub"
+  #       enabled: true
