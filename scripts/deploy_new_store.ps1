@@ -61,21 +61,36 @@ python -m venv .venv
 & .\.venv\Scripts\python.exe -c "import cv2, ultralytics, boxmot; print('Python deps OK')"
 
 Step "6/8  Configure this store"
-$storeId = Read-Host "Store id (e.g. anthem, bullhead, prescott)"
-$nvrHost = Read-Host "NVR local IP (e.g. 192.168.0.153)"
-$nvrPass = Read-Host "NVR admin password"
-$channel = Read-Host "Channel number of the FRONT-ENTRANCE camera (e.g. 2)"
+function Read-Required($prompt) {
+    while ($true) {
+        $v = Read-Host $prompt
+        if ($v -ne "") { return $v }
+        Write-Host "  ! value cannot be empty, try again" -ForegroundColor Yellow
+    }
+}
+$storeId  = Read-Required "Store id (e.g. anthem, bullhead, prescott)"
+$nvrHost  = Read-Required "NVR local IP (e.g. 192.168.0.153)"
+$nvrUser  = Read-Required "NVR admin USERNAME (usually 'admin', sometimes a custom name like 'camerongelinas')"
+$nvrPass  = Read-Required "NVR admin password"
+$channel  = Read-Required "Channel number of the FRONT-ENTRANCE camera (e.g. 2)"
 
 & .\.venv\Scripts\python.exe -c @"
 import yaml
 cfg = {'stores': [{'id': '$storeId', 'name': '$storeId', 'enabled': True,
-  'nvr': {'host': '$nvrHost', 'port': 554, 'username': 'admin', 'password': '$nvrPass'},
+  'nvr': {'host': '$nvrHost', 'port': 554, 'username': '$nvrUser', 'password': '$nvrPass'},
   'cameras': [{'name': 'front', 'channel': int('$channel'), 'stream': 'main', 'enabled': True}]}]}
 open('config/stores.yaml', 'w').write(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
 print('wrote config/stores.yaml')
 "@
 
-$rtsp = "rtsp://admin:${nvrPass}@${nvrHost}:554/cam/realmonitor?channel=${channel}&subtype=0"
+$rtsp = "rtsp://${nvrUser}:${nvrPass}@${nvrHost}:554/cam/realmonitor?channel=${channel}&subtype=0"
+
+Step "6.5  Verify the camera connection before going further"
+& .\.venv\Scripts\python.exe scripts\test_stream.py $rtsp
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Could not connect to camera. Check the IP / username / password / channel and re-run this script." -ForegroundColor Red
+    exit 1
+}
 
 Step "7/8  Pick the entry line (a window will open)"
 Write-Host "Click 2 points across the doorway threshold + 1 point on the inside-the-store side."
