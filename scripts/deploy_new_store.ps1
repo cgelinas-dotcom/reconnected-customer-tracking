@@ -123,14 +123,22 @@ set BUSINESS_HOURS=9-21
 `"$pyExe`" `"$root\scripts\run_dashboard.py`"
 "@ | Set-Content "$root\scripts\start_dashboard.bat" -Encoding ASCII
 
-schtasks /Create /F /SC ONSTART /RU SYSTEM /TN "CustomerTracking_Pipeline" /TR "`"$root\scripts\start_pipeline.bat`"" /RL HIGHEST
-schtasks /Create /F /SC ONSTART /RU SYSTEM /TN "CustomerTracking_Dashboard" /TR "`"$root\scripts\start_dashboard.bat`"" /RL HIGHEST
+# Use Register-ScheduledTask (PowerShell native) — schtasks.exe strips quotes
+# around paths with spaces, breaking on usernames like "Reconnected Kingman".
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+$pipelineAction = New-ScheduledTaskAction -Execute "$root\scripts\start_pipeline.bat"
+Register-ScheduledTask -TaskName "CustomerTracking_Pipeline" -Action $pipelineAction -Trigger $trigger -Principal $principal -Force | Out-Null
+
+$dashAction = New-ScheduledTaskAction -Execute "$root\scripts\start_dashboard.bat"
+Register-ScheduledTask -TaskName "CustomerTracking_Dashboard" -Action $dashAction -Trigger $trigger -Principal $principal -Force | Out-Null
 powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 powercfg /hibernate off
-schtasks /Run /TN "CustomerTracking_Pipeline"
-schtasks /Run /TN "CustomerTracking_Dashboard"
+Start-ScheduledTask -TaskName "CustomerTracking_Pipeline"
+Start-ScheduledTask -TaskName "CustomerTracking_Dashboard"
 
 Write-Host ""
 Write-Host "DONE." -ForegroundColor Green
