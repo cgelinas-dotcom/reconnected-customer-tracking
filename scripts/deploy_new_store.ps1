@@ -108,8 +108,23 @@ print('entry_line saved')
 Step "8/8  Scheduled tasks (auto-start on boot) + disable sleep"
 $root = "$env:USERPROFILE\Desktop\customer-tracking"
 $pyExe = "$root\.venv\Scripts\python.exe"
-schtasks /Create /F /SC ONSTART /RU SYSTEM /TN "CustomerTracking_Pipeline" /TR "cmd /c set FRAME_SKIP=3 && set BUSINESS_HOURS=9-21 && `"$pyExe`" `"$root\scripts\run_multi.py`"" /RL HIGHEST
-schtasks /Create /F /SC ONSTART /RU SYSTEM /TN "CustomerTracking_Dashboard" /TR "`"$pyExe`" `"$root\scripts\run_dashboard.py`"" /RL HIGHEST
+
+# Write wrapper batch files (handle Windows usernames with spaces — the inline
+# cmd /c form breaks when paths contain spaces).
+@"
+@echo off
+set FRAME_SKIP=3
+set BUSINESS_HOURS=9-21
+`"$pyExe`" `"$root\scripts\run_multi.py`"
+"@ | Set-Content "$root\scripts\start_pipeline.bat" -Encoding ASCII
+
+@"
+@echo off
+`"$pyExe`" `"$root\scripts\run_dashboard.py`"
+"@ | Set-Content "$root\scripts\start_dashboard.bat" -Encoding ASCII
+
+schtasks /Create /F /SC ONSTART /RU SYSTEM /TN "CustomerTracking_Pipeline" /TR "`"$root\scripts\start_pipeline.bat`"" /RL HIGHEST
+schtasks /Create /F /SC ONSTART /RU SYSTEM /TN "CustomerTracking_Dashboard" /TR "`"$root\scripts\start_dashboard.bat`"" /RL HIGHEST
 powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
