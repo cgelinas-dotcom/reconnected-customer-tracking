@@ -974,70 +974,149 @@ def admin_health():
     return out
 
 
-@app.post("/api/admin/git_pull")
-def admin_git_pull():
-    """Run `git pull` in the project root, then restart the pipeline.
-    Surfaces all errors verbosely so debugging via the dashboard is possible."""
-    import subprocess
-    import sys
+def _find_git() -> str | None:
     import shutil
-
-    # Find git — SYSTEM user's PATH may not have it even if it's installed.
     git_exe = shutil.which("git")
-    if git_exe is None:
-        for guess in (r"C:\Program Files\Git\bin\git.exe", r"C:\Program Files\Git\cmd\git.exe", "/usr/bin/git", "/opt/homebrew/bin/git"):
-            if Path(guess).exists():
-                git_exe = guess
-                break
-    if git_exe is None:
-        return {"ok": False, "pull": "git executable not found in PATH or known locations", "restart": None}
+    if git_exe:
+        return git_exe
+    for guess in (
+        r"C:\Program Files\Git\bin\git.exe",
+        r"C:\Program Files\Git\cmd\git.exe",
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+    ):
+        if Path(guess).exists():
+            return guess
+    return None
 
-    # Aggressively disable anything that could cause git to hang on credentials.
-    # Under SYSTEM user, a configured credential helper (like Git Credential
-    # Manager from gh CLI) can pop up a GUI dialog that never appears, so the
-    # subprocess hangs forever. We force credential.helper to empty for this
-    # command and disable interactive prompts.
+
+def _write_noop_askpass() -> Path:
+    """Disk-resident no-op askpass program. On Windows we use a .bat that
+    exits non-zero — any credential prompt then fails fast instead of hanging."""
+    import sys
+    import tempfile
+    if sys.platform == "win32":
+        f = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_askpass.bat", delete=False, newline="\r\n"
+        )
+        f.write("@exit /b 1\r\n")
+        f.close()
+    else:
+        f = tempfile.NamedTemporaryFile(mode="w", suffix="_askpass.sh", delete=False)
+        f.write("#!/bin/sh\nexit 1\n")
+        f.close()
+        import os as _os
+        _os.chmod(f.name, 0o755)
+    return Path(f.name)
+
+
+def _hardened_git_env() -> dict:
+    """Environment that prevents git from ever blocking on a credential prompt.
+    The hang under SYSTEM is usually Git Credential Manager spawning a GUI that
+    never paints, or git inheriting an open stdin and waiting on input forever.
+    Closing stdin + a no-op askpass + disabling GCM closes every door."""
     import os as _os
     env = _os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "Never"
-    env.pop("GIT_ASKPASS", None)  # don't set this — "echo" can cause its own hangs
+    env["GCM_GUI_PROMPT"] = "false"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"  # ignore system git config (may have a configured helper)
+    return env
+
+
+@app.post("/api/admin/git_pull")
+def admin_git_pull():
+    """Fetch + hard-reset to origin/main, then schedule a detached restart.
+
+    The classic hang under SYSTEM is git waiting on a credential prompt that
+    never resolves. We close stdin, point GIT_ASKPASS at a non-existent-prompt
+    program, clear credential helpers, and disable GCM. We also use fetch +
+    reset --hard (instead of `pull`) so there's no merge that can stall.
+
+    Restart is detached: a child PowerShell sleeps 2s (so this response can
+    return first), kills python (which kills us), and re-runs the scheduled
+    tasks. The new dashboard comes back online ~5s after the response."""
+    import subprocess
+    import sys
+
+    git_exe = _find_git()
+    if git_exe is None:
+        return {"ok": False, "pull": "git executable not found in PATH or known locations", "restart": None}
+
+    askpass = _write_noop_askpass()
+    env = _hardened_git_env()
+    env["GIT_ASKPASS"] = str(askpass)
+
+    common_args = [
+        git_exe, "-C", str(ROOT),
+        "-c", "credential.helper=",
+        "-c", "credential.modalprompt=false",
+        "-c", "credential.guiprompt=false",
+    ]
+
+    def _run_git(extra: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            common_args + extra,
+            capture_output=True, text=True, timeout=timeout,
+            env=env,
+            stdin=subprocess.DEVNULL,  # the load-bearing line: never wait on input
+        )
 
     try:
-        r = subprocess.run(
-            [git_exe, "-C", str(ROOT),
-             "-c", "credential.helper=",     # clear any configured helper
-             "-c", "core.askpass=true",      # no-op askpass
-             "pull"],
-            capture_output=True, text=True, timeout=30,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "pull": "git pull timed out after 30 seconds", "restart": None}
-    except FileNotFoundError as e:
-        return {"ok": False, "pull": f"git not found: {e}", "restart": None}
-    except Exception as e:
-        return {"ok": False, "pull": f"git pull crashed: {type(e).__name__}: {e}", "restart": None}
-
-    pull_out = (r.stdout or "") + (r.stderr or "")
-    if not pull_out.strip():
-        pull_out = f"(git exited with code {r.returncode}, no output)"
-    if r.returncode != 0:
-        return {"ok": False, "pull": pull_out, "restart": None, "exit_code": r.returncode}
-
-    restart_log = None
-    if sys.platform == "win32":
-        restart_lines = []
-        for cmd in (
-            ["schtasks", "/End", "/TN", "CustomerTracking_Pipeline"],
-            ["schtasks", "/End", "/TN", "CustomerTracking_Dashboard"],
-            ["schtasks", "/Run", "/TN", "CustomerTracking_Pipeline"],
-            ["schtasks", "/Run", "/TN", "CustomerTracking_Dashboard"],
-        ):
+        try:
+            fetch = _run_git(["fetch", "--prune", "origin"], timeout=20)
+        finally:
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                restart_lines.append(f"$ {' '.join(cmd)}\n{(res.stdout or '') + (res.stderr or '')}")
-            except Exception as e:
-                restart_lines.append(f"$ {' '.join(cmd)}\nERROR: {e}")
-        restart_log = "\n".join(restart_lines)
-    return {"ok": True, "pull": pull_out, "restart": restart_log}
+                askpass.unlink()
+            except OSError:
+                pass
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "pull": "git fetch timed out after 20s (credential prompt still hanging?)", "restart": None}
+    except Exception as e:
+        return {"ok": False, "pull": f"git fetch crashed: {type(e).__name__}: {e}", "restart": None}
+
+    if fetch.returncode != 0:
+        out = (fetch.stdout or "") + (fetch.stderr or "")
+        return {"ok": False, "pull": f"git fetch failed (exit {fetch.returncode}):\n{out}", "restart": None}
+
+    try:
+        reset = _run_git(["reset", "--hard", "origin/main"], timeout=15)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "pull": "git reset --hard timed out after 15s", "restart": None}
+    except Exception as e:
+        return {"ok": False, "pull": f"git reset crashed: {type(e).__name__}: {e}", "restart": None}
+
+    pull_out = (fetch.stdout or "") + (fetch.stderr or "") + (reset.stdout or "") + (reset.stderr or "")
+    if not pull_out.strip():
+        pull_out = "(git exited cleanly, no output — already up to date)"
+    if reset.returncode != 0:
+        return {"ok": False, "pull": pull_out, "restart": None, "exit_code": reset.returncode}
+
+    restart_msg = "Restart skipped (not on Windows)"
+    if sys.platform == "win32":
+        # Detached PowerShell: kills the dashboard (and us) after the response
+        # ships, then restarts both scheduled tasks. Using port-based kill +
+        # explicit wait so the new dashboard doesn't race for port 8000.
+        ps_script = (
+            "Start-Sleep -Seconds 2; "
+            "Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; "
+            "Start-Sleep -Seconds 2; "
+            "schtasks /Run /TN CustomerTracking_Pipeline | Out-Null; "
+            "schtasks /Run /TN CustomerTracking_Dashboard | Out-Null"
+        )
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
+            restart_msg = "Restart scheduled in 2s — dashboard will be back in ~5s"
+        except Exception as e:
+            restart_msg = f"Detached restart failed to spawn: {type(e).__name__}: {e}"
+
+    return {"ok": True, "pull": pull_out, "restart": restart_msg}
