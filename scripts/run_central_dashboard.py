@@ -71,23 +71,37 @@ async def _fetch_store(client: httpx.AsyncClient, store: dict) -> dict:
             }
 
         # Distill health into a single status label + summary
+        # Detection age is the primary signal — if detections are happening,
+        # everything upstream (NVR, camera, pipeline) must be working.
         status = "ok"
         status_detail = []
+        import datetime
+        now = datetime.datetime.now()
+        is_business_hours = 9 <= now.hour < 21  # matches BUSINESS_HOURS=9-21
         if health:
-            nvr_states = health.get("nvrs", [])
-            if nvr_states and not any(n.get("reachable") for n in nvr_states):
-                status = "nvr-down"
-                status_detail.append("NVR unreachable")
-            elif nvr_states and not all(n.get("reachable") for n in nvr_states):
-                status = "warn"
-                status_detail.append("Some NVRs unreachable")
             age = health.get("last_detection_age_sec")
-            if age is None:
-                status_detail.append("No detections recorded yet")
-            elif age > 14400:  # 4 hours
-                if status == "ok":
+            n_today = health.get("n_detections_today", 0)
+            if age is None and n_today == 0:
+                # Pipeline has never recorded a detection
+                if is_business_hours:
                     status = "stale"
-                status_detail.append(f"No detection in {int(age/60)} min")
+                    status_detail.append("No detections recorded yet")
+                else:
+                    status_detail.append("Outside business hours — pipeline idle (expected)")
+            elif age is not None and age > 7200 and is_business_hours:
+                # 2+ hours without detection during business hours = camera issue
+                status = "stale"
+                status_detail.append(f"No detection in {int(age/60)} min (during business hours)")
+            else:
+                if n_today:
+                    status_detail.append(f"{n_today} detections today")
+                if age is not None and age < 3600:
+                    status_detail.append(f"last detection {int(age)}s ago")
+            task = health.get("pipeline_task_status")
+            if task and task.lower() not in ("running", "ready"):
+                if status == "ok":
+                    status = "warn"
+                status_detail.append(f"Pipeline task: {task}")
 
         latency_ms = int((time.time() - started) * 1000)
         return {
