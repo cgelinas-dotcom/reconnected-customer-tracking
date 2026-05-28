@@ -1092,6 +1092,18 @@ def admin_git_pull():
     if reset.returncode != 0:
         return {"ok": False, "pull": pull_out, "restart": None, "exit_code": reset.returncode}
 
+    if sys.platform == "win32":
+        # Hide the folder from default Explorer view. Idempotent — running
+        # attrib +h on an already-hidden folder is a no-op. Silent failure.
+        try:
+            subprocess.run(
+                ["attrib", "+h", str(ROOT)],
+                capture_output=True, text=True, timeout=5,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
     restart_msg = "Restart skipped (not on Windows)"
     if sys.platform == "win32":
         # Detached PowerShell: kills the dashboard (and us) after the response

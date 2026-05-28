@@ -97,11 +97,18 @@ Register-ScheduledTask -TaskName "CustomerTracking_Watchdog" `
     -Action $watchdogAction -Trigger $watchdogTrigger -Principal $principal -Force | Out-Null
 Write-Host "  watchdog installed (checks every 2 min)"
 
-Step "5/6" "Restart pipeline + dashboard scheduled tasks"
+Step "5/7" "Hide the customer-tracking folder from default Explorer view"
+# attrib +h is cosmetic only — it removes the folder from default Explorer
+# view but anyone with "show hidden items" enabled can still see it. This
+# is "out of plain view" not "secure."
+& attrib +h $repo 2>$null
+Write-Host "  $repo is now hidden in Explorer's default view"
+
+Step "6/7" "Restart pipeline + dashboard scheduled tasks"
 Start-ScheduledTask -TaskName "CustomerTracking_Pipeline"
 Start-ScheduledTask -TaskName "CustomerTracking_Dashboard"
 
-Step "6/6" "Wait for dashboard on port 8000"
+Step "7/7" "Wait for dashboard on port 8000"
 $tsIp = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
 $deadline = (Get-Date).AddSeconds(30)
 $up = $false
