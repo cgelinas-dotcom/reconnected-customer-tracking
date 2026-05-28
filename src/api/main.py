@@ -976,16 +976,40 @@ def admin_health():
 
 @app.post("/api/admin/git_pull")
 def admin_git_pull():
-    """Run `git pull` in the project root, then restart the pipeline."""
+    """Run `git pull` in the project root, then restart the pipeline.
+    Surfaces all errors verbosely so debugging via the dashboard is possible."""
     import subprocess
     import sys
-    r = subprocess.run(
-        ["git", "-C", str(ROOT), "pull"],
-        capture_output=True, text=True,
-    )
-    pull_out = r.stdout + r.stderr
+    import shutil
+
+    # Find git — SYSTEM user's PATH may not have it even if it's installed.
+    git_exe = shutil.which("git")
+    if git_exe is None:
+        for guess in (r"C:\Program Files\Git\bin\git.exe", r"C:\Program Files\Git\cmd\git.exe", "/usr/bin/git", "/opt/homebrew/bin/git"):
+            if Path(guess).exists():
+                git_exe = guess
+                break
+    if git_exe is None:
+        return {"ok": False, "pull": "git executable not found in PATH or known locations", "restart": None}
+
+    try:
+        r = subprocess.run(
+            [git_exe, "-C", str(ROOT), "pull"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "pull": "git pull timed out after 60 seconds", "restart": None}
+    except FileNotFoundError as e:
+        return {"ok": False, "pull": f"git not found: {e}", "restart": None}
+    except Exception as e:
+        return {"ok": False, "pull": f"git pull crashed: {type(e).__name__}: {e}", "restart": None}
+
+    pull_out = (r.stdout or "") + (r.stderr or "")
+    if not pull_out.strip():
+        pull_out = f"(git exited with code {r.returncode}, no output)"
     if r.returncode != 0:
-        return {"ok": False, "pull": pull_out, "restart": None}
+        return {"ok": False, "pull": pull_out, "restart": None, "exit_code": r.returncode}
+
     restart_log = None
     if sys.platform == "win32":
         restart_lines = []
@@ -995,7 +1019,10 @@ def admin_git_pull():
             ["schtasks", "/Run", "/TN", "CustomerTracking_Pipeline"],
             ["schtasks", "/Run", "/TN", "CustomerTracking_Dashboard"],
         ):
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            restart_lines.append(f"$ {' '.join(cmd)}\n{res.stdout}{res.stderr}")
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                restart_lines.append(f"$ {' '.join(cmd)}\n{(res.stdout or '') + (res.stderr or '')}")
+            except Exception as e:
+                restart_lines.append(f"$ {' '.join(cmd)}\nERROR: {e}")
         restart_log = "\n".join(restart_lines)
     return {"ok": True, "pull": pull_out, "restart": restart_log}
