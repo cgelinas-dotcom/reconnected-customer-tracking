@@ -57,6 +57,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 OUT_VIDEO = ROOT / "data" / "out_annotated.mp4"
+LIVE_DIR = ROOT / "data" / "live"
 DB_PATH = ROOT / "data" / "events.sqlite"
 MODEL_NAME = "yolov8n.pt"
 PERSON_CLASS_ID = 0
@@ -242,6 +243,8 @@ def main() -> int:
     print(f"Input: {w}x{h} @ {fps:.1f}fps")
 
     OUT_VIDEO.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    live_path = LIVE_DIR / f"{store_id}_{camera_id}.jpg"
     writer = cv2.VideoWriter(
         str(OUT_VIDEO), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
     )
@@ -291,6 +294,7 @@ def main() -> int:
     frames = 0
     detections = 0
     start = time.time()
+    last_live_write_ts = 0.0  # for the live-view JPEG throttle
 
     try:
         while True:
@@ -430,6 +434,18 @@ def main() -> int:
             cv2.putText(frame, overlay, (12, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             writer.write(frame)
+
+            # Live view: write the latest annotated frame to disk ~2x/sec.
+            # The dashboard polls this file and shows it to Cam so he can
+            # watch the YOLO boxes + track_id + P# labels in near-real-time.
+            # File is overwritten in place, so disk usage stays trivial.
+            now_ts = time.time()
+            if now_ts - last_live_write_ts > 0.5:
+                try:
+                    cv2.imwrite(str(live_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    last_live_write_ts = now_ts
+                except Exception as _e:
+                    pass  # don't crash the pipeline if disk write hiccups
 
             if show_preview:
                 cv2.imshow("pipeline", frame)

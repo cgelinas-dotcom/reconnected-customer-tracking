@@ -22,6 +22,7 @@ ROOT = Path(__file__).parent.parent.parent
 DB_PATH = ROOT / "data" / "events.sqlite"
 DASHBOARD_DIR = ROOT / "dashboard"
 CONFIG_PATH = ROOT / "config" / "stores.yaml"
+LIVE_DIR = ROOT / "data" / "live"
 
 app = FastAPI(title="Customer Tracking — Local Dev")
 
@@ -879,6 +880,39 @@ def admin_snapshot(camera_name: str, overlay: int = 1):
         raise HTTPException(500, "JPEG encode failed")
     from fastapi.responses import Response
     return Response(content=jpg.tobytes(), media_type="image/jpeg")
+
+
+@app.get("/api/admin/live/{camera_name}")
+def admin_live_frame(camera_name: str):
+    """Return the most recent annotated frame written by the pipeline for
+    this camera. The pipeline writes data/live/<store>_<camera>.jpg ~2x/sec.
+    The frame already has YOLO boxes, ByteTrack track IDs, OSNet P# labels,
+    entry line, and exclusion line drawn on it. Lets Cam watch live what
+    the system is doing — essential for re-ID threshold tuning."""
+    import yaml
+    if not CONFIG_PATH.exists():
+        raise HTTPException(404, "stores.yaml not found")
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        raise HTTPException(500, f"stores.yaml unparseable: {e}")
+    stores = cfg.get("stores", [])
+    if not stores:
+        raise HTTPException(404, "no stores in config")
+    store_id = stores[0].get("id", "unknown")
+
+    path = LIVE_DIR / f"{store_id}_{camera_name}.jpg"
+    if not path.exists():
+        raise HTTPException(
+            404,
+            f"no live frame yet for {store_id}/{camera_name} — "
+            "pipeline may not be running, or hasn't processed a frame yet",
+        )
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.post("/api/admin/restart_pipeline")

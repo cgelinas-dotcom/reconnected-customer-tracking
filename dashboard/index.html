@@ -47,6 +47,23 @@
         <button onclick="adminGitPull()" class="danger">Pull from GitHub + restart</button>
       </div>
       <div id="admin-snapshots" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px"></div>
+
+      <details style="margin-top:8px" id="live-view-details">
+        <summary style="cursor:pointer;font-size:13px;font-weight:600">📹 Live pipeline view — watch ByteTrack + OSNet assign IDs in real time</summary>
+        <div style="font-size:12px;color:var(--muted);margin:8px 0">
+          Frames are updated ~2x/sec by the running pipeline. Green boxes are YOLO person detections;
+          the label above each box is <code>ID &lt;track_id&gt;  P&lt;person_id&gt;</code>. Yellow line is the
+          entry tripwire; red line (if drawn) is the staff-zone exclusion line.
+          If you see no image, the pipeline isn't running on this store.
+        </div>
+        <div style="margin-bottom:8px">
+          <label style="font-size:12px">
+            <input type="checkbox" id="live-view-enabled"> Auto-refresh live view (off by default — uses bandwidth)
+          </label>
+        </div>
+        <div id="live-view-imgs" style="display:flex;flex-wrap:wrap;gap:12px"></div>
+      </details>
+
       <details style="margin-top:8px">
         <summary style="cursor:pointer;font-size:13px">Edit stores.yaml (raw)</summary>
         <textarea id="admin-config" rows="18" style="width:100%;font-family:monospace;font-size:12px;margin-top:8px;padding:8px;border-radius:6px;border:1px solid #ccc"></textarea>
@@ -338,6 +355,59 @@
       const d = await r.json();
       adminLog(r.ok ? `Saved ${d.bytes_written} bytes. Click Restart pipeline to apply.` : `ERROR: ${d.detail || JSON.stringify(d)}`);
     }
+
+    // ---------------------------------------------------------------------
+    // Live pipeline view — auto-refreshing annotated frames from the pipeline
+    // ---------------------------------------------------------------------
+    let liveViewTimer = null;
+    let liveViewCameras = [];
+
+    async function liveViewLoadCameras() {
+      const cfgR = await fetch('/api/admin/config');
+      const cfg = await cfgR.json();
+      liveViewCameras = (cfg.parsed?.stores?.[0]?.cameras) || [];
+      const container = document.getElementById('live-view-imgs');
+      if (!liveViewCameras.length) {
+        container.innerHTML = '<div style="color:#999">No cameras in config yet</div>';
+        return;
+      }
+      // One <img> per camera. Each gets its src updated by the tick.
+      container.innerHTML = liveViewCameras.map(c => `
+        <div style="border:1px solid #ddd;border-radius:8px;overflow:hidden;width:48%;background:#000">
+          <div style="background:#f0f0f0;padding:4px 8px;font-size:12px;color:#222">
+            <strong>${c.name}</strong> (ch${c.channel}) · <span id="live-status-${c.name}" style="color:#999">waiting...</span>
+          </div>
+          <img id="live-img-${c.name}" style="width:100%;display:block;background:#000;min-height:200px"
+               onerror="document.getElementById('live-status-${c.name}').textContent='No frame yet — pipeline running?'"
+               onload="document.getElementById('live-status-${c.name}').textContent='live · '+new Date().toLocaleTimeString()">
+        </div>
+      `).join('');
+    }
+
+    function liveViewTick() {
+      const t = Date.now();
+      for (const c of liveViewCameras) {
+        const img = document.getElementById(`live-img-${c.name}`);
+        if (img) img.src = `/api/admin/live/${encodeURIComponent(c.name)}?t=${t}`;
+      }
+    }
+
+    function liveViewSetEnabled(enabled) {
+      if (liveViewTimer) { clearInterval(liveViewTimer); liveViewTimer = null; }
+      if (enabled) {
+        if (!liveViewCameras.length) liveViewLoadCameras().then(liveViewTick);
+        else liveViewTick();
+        liveViewTimer = setInterval(liveViewTick, 500);  // 2 fps
+      }
+    }
+
+    document.getElementById('live-view-enabled').addEventListener('change', (e) => {
+      liveViewSetEnabled(e.target.checked);
+    });
+    // Re-load camera list when the <details> is opened (cameras may have changed)
+    document.getElementById('live-view-details').addEventListener('toggle', (e) => {
+      if (e.target.open && !liveViewCameras.length) liveViewLoadCameras();
+    });
 
     async function adminRefreshSnapshots() {
       const cfgR = await fetch('/api/admin/config');
