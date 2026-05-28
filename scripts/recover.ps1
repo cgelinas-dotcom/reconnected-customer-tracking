@@ -69,7 +69,7 @@ try {
         exit 1
     }
 } finally {
-    Remove-Item $askpass.FullName -ErrorAction SilentlyContinue
+    Remove-Item $askpassPath -ErrorAction SilentlyContinue
 }
 $head = & git rev-parse --short HEAD
 Write-Host "  HEAD is now at: $head"
