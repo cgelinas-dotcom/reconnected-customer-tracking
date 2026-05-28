@@ -35,6 +35,12 @@
   <h1>Customer Tracking — All Stores</h1>
   <div class="subtitle">Aggregating live from each store's mini PC. Auto-refreshes every 10s.</div>
 
+  <div style="margin-bottom:20px;display:flex;gap:8px;align-items:center">
+    <button onclick="pullAll()" id="pull-all-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #ccc;background:#0a66c2;color:white;cursor:pointer;font:inherit;font-weight:600">⬇️ Pull from GitHub + restart all stores</button>
+    <span id="pull-status" style="font-size:13px;color:var(--muted)"></span>
+  </div>
+  <pre id="pull-log" style="display:none;font-size:11px;background:#000;color:#0f0;padding:10px;border-radius:6px;max-height:300px;overflow:auto;white-space:pre-wrap;margin-bottom:20px"></pre>
+
   <div class="totals">
     <div class="card"><div class="label">Customers today (all stores)</div><div id="t-customers" class="value">—</div></div>
     <div class="card"><div class="label">Door crossings IN today</div><div id="t-in" class="value">—</div></div>
@@ -113,6 +119,31 @@
     }
     refresh();
     setInterval(refresh, 10000);
+
+    async function pullAll() {
+      if (!confirm("Pull latest code from GitHub on ALL 8 stores and restart each one's pipeline? Takes ~30 seconds in parallel.")) return;
+      const btn = document.getElementById('pull-all-btn');
+      const status = document.getElementById('pull-status');
+      const log = document.getElementById('pull-log');
+      btn.disabled = true; btn.style.opacity = 0.6;
+      status.textContent = 'Pulling and restarting all stores in parallel...';
+      log.style.display = 'block'; log.textContent = '';
+      try {
+        const r = await fetch('/api/all_stores/pull_all', {method: 'POST'});
+        const d = await r.json();
+        status.textContent = `${d.ok_count} / ${d.total} stores succeeded`;
+        log.textContent = d.results.map(r =>
+          `=== ${r.name} (${r.id}) — ${r.ok ? '✓ OK' : '✗ FAILED'} (${r.took_sec}s) ===\n` +
+          (r.error ? `error: ${r.error}\n` : '') +
+          (r.pull ? `--- pull ---\n${r.pull}\n` : '') +
+          (r.restart ? `--- restart ---\n${r.restart}\n` : '')
+        ).join('\n');
+      } catch (e) {
+        status.textContent = `Error: ${e.message}`;
+      } finally {
+        btn.disabled = false; btn.style.opacity = 1;
+      }
+    }
   </script>
 </body>
 </html>

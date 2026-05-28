@@ -138,6 +138,42 @@ async def all_stores():
     return {"stores": results}
 
 
+async def _pull_one(client: httpx.AsyncClient, store: dict) -> dict:
+    base = store["url"].rstrip("/")
+    started = time.time()
+    try:
+        r = await client.post(f"{base}/api/admin/git_pull", timeout=60)
+        d = r.json() if r.status_code == 200 else {"ok": False, "error": f"HTTP {r.status_code}"}
+        return {
+            "id": store.get("id"),
+            "name": store.get("name"),
+            "ok": d.get("ok", False),
+            "pull": (d.get("pull") or "")[-500:],
+            "restart": (d.get("restart") or "")[-300:],
+            "took_sec": round(time.time() - started, 1),
+        }
+    except Exception as e:
+        return {
+            "id": store.get("id"),
+            "name": store.get("name"),
+            "ok": False,
+            "error": str(e)[:120],
+            "took_sec": round(time.time() - started, 1),
+        }
+
+
+@app.post("/api/all_stores/pull_all")
+async def pull_all():
+    """Trigger 'git pull + restart' on every store in parallel."""
+    stores = load_stores()
+    if not stores:
+        return {"stores": [], "error": "No stores configured"}
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[_pull_one(client, s) for s in stores])
+    n_ok = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "ok_count": n_ok, "total": len(results)}
+
+
 @app.get("/")
 def root():
     return FileResponse(DASHBOARD_DIR / "central.html")
