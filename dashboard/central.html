@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Customer Tracking — All Stores</title>
+  <style>
+    :root { --fg: #1a1a1a; --muted: #666; --line: #eaeaea; --bg-soft: #f7f7f8; --accent: #0a7d33; --warn: #d97706; --err: #b91c1c; }
+    * { box-sizing: border-box; }
+    body { font: 14px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; max-width: 1400px; margin: 32px auto; padding: 0 16px; color: var(--fg); }
+    h1 { margin: 0 0 4px; font-size: 26px; }
+    .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
+    .totals { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+    .totals .card { background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+    .totals .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .totals .value { font-size: 32px; font-weight: 700; margin-top: 6px; }
+    h2 { font-size: 15px; margin: 28px 0 10px; color: #333; text-transform: uppercase; letter-spacing: .05em; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+    th { background: #fafafa; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .ok { color: var(--accent); }
+    .warn { color: var(--warn); }
+    .err { color: var(--err); }
+    a { color: #0a66c2; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 6px; }
+    .dot.green { background: var(--accent); }
+    .dot.red { background: var(--err); }
+    .dot.gray { background: #999; }
+  </style>
+</head>
+<body>
+  <h1>Customer Tracking — All Stores</h1>
+  <div class="subtitle">Aggregating live from each store's mini PC. Auto-refreshes every 10s.</div>
+
+  <div class="totals">
+    <div class="card"><div class="label">Customers today (all stores)</div><div id="t-customers" class="value">—</div></div>
+    <div class="card"><div class="label">Door crossings IN today</div><div id="t-in" class="value">—</div></div>
+    <div class="card"><div class="label">Stores online</div><div id="t-online" class="value">—</div></div>
+    <div class="card"><div class="label">Total tagged employees</div><div id="t-employees" class="value">—</div></div>
+  </div>
+
+  <h2>Per-store breakdown</h2>
+  <table id="per-store">
+    <thead><tr>
+      <th></th><th>Store</th>
+      <th class="num">Customers today</th>
+      <th class="num">Door IN today</th>
+      <th class="num">Door OUT today</th>
+      <th class="num">All-time persons</th>
+      <th class="num">Employees tagged</th>
+      <th>Last response</th>
+      <th></th>
+    </tr></thead>
+    <tbody><tr><td colspan="9" style="color:#999;padding:20px;text-align:center">Loading...</td></tr></tbody>
+  </table>
+
+  <script>
+    async function refresh() {
+      const r = await fetch('/api/all_stores');
+      const data = await r.json();
+      let tCust = 0, tIn = 0, tEmp = 0, online = 0;
+      const tbody = document.querySelector('#per-store tbody');
+      const rows = data.stores.map(s => {
+        const ok = s.online;
+        if (ok) {
+          tCust += s.entry?.unique_customers || 0;
+          tIn += s.entry?.customer_crossings_in || 0;
+          tEmp += s.stats?.employees_count || 0;
+          online++;
+        }
+        const dot = ok ? 'green' : 'red';
+        return `<tr>
+          <td><span class="dot ${dot}"></span></td>
+          <td><strong>${s.name}</strong><br><span style="font-size:11px;color:var(--muted)">${s.id}</span></td>
+          <td class="num">${ok ? (s.entry?.unique_customers ?? '—') : '—'}</td>
+          <td class="num">${ok ? (s.entry?.customer_crossings_in ?? '—') : '—'}</td>
+          <td class="num">${ok ? (s.entry?.total_crossings_out ?? '—') : '—'}</td>
+          <td class="num">${ok ? (s.stats?.unique_persons ?? '—') : '—'}</td>
+          <td class="num">${ok ? (s.stats?.employees_count ?? '—') : '—'}</td>
+          <td style="font-size:12px;color:${ok ? '#666' : 'var(--err)'}">${ok ? s.latency_ms + ' ms' : (s.error || 'offline')}</td>
+          <td><a href="${s.url}" target="_blank">Open →</a></td>
+        </tr>`;
+      }).join('');
+      tbody.innerHTML = rows;
+      document.getElementById('t-customers').textContent = tCust;
+      document.getElementById('t-in').textContent = tIn;
+      document.getElementById('t-online').textContent = online + ' / ' + data.stores.length;
+      document.getElementById('t-employees').textContent = tEmp;
+    }
+    refresh();
+    setInterval(refresh, 10000);
+  </script>
+</body>
+</html>

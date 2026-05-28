@@ -5,6 +5,7 @@ pyyaml>=6.0
 fastapi>=0.110
 uvicorn[standard]>=0.27
 sqlite-utils>=3.36
+httpx>=0.27
 # Person re-ID — boxmot bundles OSNet (purpose-built for person re-ID).
 # If install fails for any reason, the pipeline silently falls back to
 # ResNet18 (general-purpose, lower accuracy).

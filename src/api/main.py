@@ -21,6 +21,7 @@ from pydantic import BaseModel
 ROOT = Path(__file__).parent.parent.parent
 DB_PATH = ROOT / "data" / "events.sqlite"
 DASHBOARD_DIR = ROOT / "dashboard"
+CONFIG_PATH = ROOT / "config" / "stores.yaml"
 
 app = FastAPI(title="Customer Tracking — Local Dev")
 
@@ -754,3 +755,172 @@ def export_daily_summary(store_id: str | None = None):
 @app.get("/")
 def root():
     return FileResponse(DASHBOARD_DIR / "index.html")
+
+
+# ============================================================================
+# Remote admin endpoints (Phase 9)
+# Lets the dashboard browser edit config, view live snapshots, restart the
+# pipeline, and pull latest code — without AnyDesk-ing into the mini PC.
+# ============================================================================
+
+@app.get("/api/admin/identity")
+def admin_identity():
+    """Return basic info about this mini PC so the central dashboard can
+    tell which store it's talking to."""
+    import socket
+    try:
+        with open(CONFIG_PATH) as f:
+            import yaml
+            cfg = yaml.safe_load(f)
+        stores = cfg.get("stores", [])
+        store_id = stores[0]["id"] if stores else "unknown"
+        store_name = stores[0].get("name", store_id) if stores else "unknown"
+    except Exception:
+        store_id = store_name = "unknown"
+    return {
+        "store_id": store_id,
+        "store_name": store_name,
+        "hostname": socket.gethostname(),
+    }
+
+
+@app.get("/api/admin/config")
+def admin_get_config():
+    """Read current stores.yaml as text + parsed dict."""
+    if not CONFIG_PATH.exists():
+        return {"raw": "", "parsed": None, "error": "stores.yaml not found"}
+    raw = CONFIG_PATH.read_text(encoding="utf-8")
+    try:
+        import yaml
+        parsed = yaml.safe_load(raw)
+    except Exception as e:
+        parsed = None
+        return {"raw": raw, "parsed": None, "error": str(e)}
+    return {"raw": raw, "parsed": parsed, "error": None}
+
+
+class ConfigUpdate(BaseModel):
+    raw: str
+
+
+@app.put("/api/admin/config")
+def admin_put_config(payload: ConfigUpdate):
+    """Save updated stores.yaml. Validates as YAML before writing."""
+    import yaml
+    try:
+        parsed = yaml.safe_load(payload.raw)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid YAML: {e}")
+    if not isinstance(parsed, dict) or "stores" not in parsed:
+        raise HTTPException(400, "Config must have a top-level 'stores' key")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(payload.raw, encoding="utf-8")
+    return {"ok": True, "bytes_written": len(payload.raw)}
+
+
+@app.get("/api/admin/snapshot/{camera_name}")
+def admin_snapshot(camera_name: str, overlay: int = 1):
+    """Pull a fresh frame from the named camera in stores.yaml. Optionally
+    overlay the entry_line (yellow) and exclusion_line (red). Returns JPEG."""
+    import yaml
+    import cv2
+    import numpy as np
+
+    if not CONFIG_PATH.exists():
+        raise HTTPException(404, "No stores.yaml")
+    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    stores = cfg.get("stores", [])
+    if not stores:
+        raise HTTPException(404, "No stores in config")
+    store = stores[0]
+    camera = next((c for c in store.get("cameras", []) if c.get("name") == camera_name), None)
+    if camera is None:
+        raise HTTPException(404, f"Camera {camera_name!r} not found")
+
+    nvr = store.get("nvr", {})
+    user = nvr.get("username", "admin")
+    pw = nvr.get("password", "")
+    host = nvr.get("host")
+    port = nvr.get("port", 554)
+    channel = camera.get("channel")
+    subtype = 1 if camera.get("stream", "sub") == "sub" else 0
+    url = f"rtsp://{user}:{pw}@{host}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}"
+
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        raise HTTPException(502, "Could not read frame from camera")
+
+    if overlay:
+        def _draw_line(spec: str, color, label: str):
+            try:
+                parts = [int(x) for x in spec.split(",")]
+                x1, y1, x2, y2, idx, idy = parts
+            except Exception:
+                return
+            cv2.line(frame, (x1, y1), (x2, y2), color, 12)
+            mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+            mag = (idx * idx + idy * idy) ** 0.5
+            if mag > 0:
+                ax = int(mx + 250 * idx / mag)
+                ay = int(my + 250 * idy / mag)
+                cv2.arrowedLine(frame, (mx, my), (ax, ay), color, 8, tipLength=0.3)
+                cv2.putText(frame, label, (ax + 20, ay),
+                            cv2.FONT_HERSHEY_SIMPLEX, 3, color, 6)
+        if camera.get("entry_line"):
+            _draw_line(camera["entry_line"], (0, 200, 255), "INSIDE")
+        if camera.get("exclusion_line"):
+            _draw_line(camera["exclusion_line"], (50, 50, 220), "STAFF")
+
+    ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        raise HTTPException(500, "JPEG encode failed")
+    from fastapi.responses import Response
+    return Response(content=jpg.tobytes(), media_type="image/jpeg")
+
+
+@app.post("/api/admin/restart_pipeline")
+def admin_restart_pipeline():
+    """Stop+start the CustomerTracking_Pipeline scheduled task (Windows only).
+    On Mac/Linux this is a no-op and returns a warning."""
+    import sys
+    import subprocess
+    if sys.platform != "win32":
+        return {"ok": False, "skipped": True, "reason": "not running on Windows"}
+    out: list[str] = []
+    for cmd in (
+        ["schtasks", "/End", "/TN", "CustomerTracking_Pipeline"],
+        ["schtasks", "/Run", "/TN", "CustomerTracking_Pipeline"],
+    ):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        out.append(f"$ {' '.join(cmd)}\n{r.stdout}{r.stderr}")
+    return {"ok": True, "log": "\n".join(out)}
+
+
+@app.post("/api/admin/git_pull")
+def admin_git_pull():
+    """Run `git pull` in the project root, then restart the pipeline."""
+    import subprocess
+    import sys
+    r = subprocess.run(
+        ["git", "-C", str(ROOT), "pull"],
+        capture_output=True, text=True,
+    )
+    pull_out = r.stdout + r.stderr
+    if r.returncode != 0:
+        return {"ok": False, "pull": pull_out, "restart": None}
+    restart_log = None
+    if sys.platform == "win32":
+        restart_lines = []
+        for cmd in (
+            ["schtasks", "/End", "/TN", "CustomerTracking_Pipeline"],
+            ["schtasks", "/End", "/TN", "CustomerTracking_Dashboard"],
+            ["schtasks", "/Run", "/TN", "CustomerTracking_Pipeline"],
+            ["schtasks", "/Run", "/TN", "CustomerTracking_Dashboard"],
+        ):
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            restart_lines.append(f"$ {' '.join(cmd)}\n{res.stdout}{res.stderr}")
+        restart_log = "\n".join(restart_lines)
+    return {"ok": True, "pull": pull_out, "restart": restart_log}

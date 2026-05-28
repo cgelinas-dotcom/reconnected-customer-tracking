@@ -35,8 +35,26 @@
   </style>
 </head>
 <body>
-  <h1>Customer Tracking</h1>
-  <div class="subtitle"><span class="dot"></span>Local dev — auto-refreshes every 5s</div>
+  <h1>Customer Tracking <span id="store-name" style="font-weight:400;color:var(--muted);font-size:18px"></span></h1>
+  <div class="subtitle"><span class="dot"></span>Live — auto-refreshes every 5s</div>
+
+  <details style="margin-bottom:24px;border:1px solid var(--line);border-radius:10px;padding:10px 14px;background:#fafafa">
+    <summary style="cursor:pointer;font-weight:600">⚙️ Remote admin — preview cameras, edit config, restart, update from GitHub</summary>
+    <div style="margin-top:12px">
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        <button onclick="adminRefreshSnapshots()">Refresh snapshots</button>
+        <button onclick="adminRestartPipeline()">Restart pipeline</button>
+        <button onclick="adminGitPull()" class="danger">Pull from GitHub + restart</button>
+      </div>
+      <div id="admin-snapshots" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px"></div>
+      <details style="margin-top:8px">
+        <summary style="cursor:pointer;font-size:13px">Edit stores.yaml (raw)</summary>
+        <textarea id="admin-config" rows="18" style="width:100%;font-family:monospace;font-size:12px;margin-top:8px;padding:8px;border-radius:6px;border:1px solid #ccc"></textarea>
+        <button onclick="adminSaveConfig()" style="margin-top:6px">Save config (does NOT restart — click Restart pipeline after)</button>
+      </details>
+      <pre id="admin-log" style="margin-top:12px;font-size:11px;background:#000;color:#0f0;padding:10px;border-radius:6px;max-height:200px;overflow:auto;white-space:pre-wrap"></pre>
+    </div>
+  </details>
 
   <h2>Today (entry-line counting — primary metric)</h2>
   <div id="entry-stats" class="row"></div>
@@ -285,6 +303,67 @@
     function refresh() { loadEntryStats(); loadStats(); loadVisitStats(); loadByStore(); loadVisits(); loadPersons(); loadChart(); loadSettings(); }
     refresh();
     setInterval(refresh, 5000);
+
+    // ---------------------------------------------------------------------
+    // Remote admin
+    // ---------------------------------------------------------------------
+    async function adminLoadIdentity() {
+      const r = await fetch('/api/admin/identity');
+      const d = await r.json();
+      document.getElementById('store-name').textContent = `· ${d.store_name || d.store_id}`;
+      document.title = `${d.store_name || d.store_id} — Customer Tracking`;
+    }
+
+    async function adminLoadConfig() {
+      const r = await fetch('/api/admin/config');
+      const d = await r.json();
+      document.getElementById('admin-config').value = d.raw || '';
+    }
+
+    async function adminSaveConfig() {
+      const raw = document.getElementById('admin-config').value;
+      const r = await fetch('/api/admin/config', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({raw}),
+      });
+      const d = await r.json();
+      adminLog(r.ok ? `Saved ${d.bytes_written} bytes. Click Restart pipeline to apply.` : `ERROR: ${d.detail || JSON.stringify(d)}`);
+    }
+
+    async function adminRefreshSnapshots() {
+      const cfgR = await fetch('/api/admin/config');
+      const cfg = await cfgR.json();
+      const cameras = (cfg.parsed?.stores?.[0]?.cameras) || [];
+      const container = document.getElementById('admin-snapshots');
+      container.innerHTML = cameras.length
+        ? cameras.map(c => `<div style="border:1px solid #ddd;border-radius:8px;overflow:hidden;width:48%"><div style="background:#f0f0f0;padding:4px 8px;font-size:12px"><strong>${c.name}</strong> (ch${c.channel})</div><img src="/api/admin/snapshot/${encodeURIComponent(c.name)}?t=${Date.now()}" style="width:100%;display:block" onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'Camera unreachable',style:'padding:40px;text-align:center;color:#999'}))"></div>`).join('')
+        : '<div style="color:#999">No cameras in config yet</div>';
+    }
+
+    async function adminRestartPipeline() {
+      adminLog('Restarting pipeline...');
+      const r = await fetch('/api/admin/restart_pipeline', {method: 'POST'});
+      const d = await r.json();
+      adminLog((d.ok ? '✓ Pipeline restarted\n' : '✗ Restart failed\n') + (d.log || d.reason || ''));
+    }
+
+    async function adminGitPull() {
+      if (!confirm('Pull latest code from GitHub and restart? Takes ~10 seconds.')) return;
+      adminLog('Running git pull...');
+      const r = await fetch('/api/admin/git_pull', {method: 'POST'});
+      const d = await r.json();
+      adminLog((d.ok ? '✓ Pulled + restarted\n' : '✗ Pull failed\n') + (d.pull || '') + '\n' + (d.restart || ''));
+    }
+
+    function adminLog(text) {
+      const el = document.getElementById('admin-log');
+      const ts = new Date().toLocaleTimeString();
+      el.textContent = `[${ts}] ${text}\n\n` + el.textContent;
+    }
+
+    adminLoadIdentity();
+    adminLoadConfig();
   </script>
 </body>
 </html>
