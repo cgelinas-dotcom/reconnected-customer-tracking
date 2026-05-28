@@ -992,13 +992,23 @@ def admin_git_pull():
     if git_exe is None:
         return {"ok": False, "pull": "git executable not found in PATH or known locations", "restart": None}
 
+    # Disable interactive credential prompts (otherwise git hangs forever when
+    # running under SYSTEM user with no credential helper). For public repos
+    # we never need auth.
+    import os as _os
+    env = _os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"  # any failed prompt just gets "echo" and fails fast
+    env["GCM_INTERACTIVE"] = "Never"
+
     try:
         r = subprocess.run(
             [git_exe, "-C", str(ROOT), "pull"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=30,
+            env=env,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "pull": "git pull timed out after 60 seconds", "restart": None}
+        return {"ok": False, "pull": "git pull timed out after 30 seconds", "restart": None}
     except FileNotFoundError as e:
         return {"ok": False, "pull": f"git not found: {e}", "restart": None}
     except Exception as e:
