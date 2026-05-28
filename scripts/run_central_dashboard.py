@@ -35,6 +35,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 CONFIG_PATH = ROOT / "config" / "central.yaml"
 EXAMPLE_PATH = ROOT / "config" / "central.example.yaml"
@@ -170,6 +171,134 @@ async def pull_all():
         return {"stores": [], "error": "No stores configured"}
     async with httpx.AsyncClient() as client:
         results = await asyncio.gather(*[_pull_one(client, s) for s in stores])
+    n_ok = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "ok_count": n_ok, "total": len(results)}
+
+
+@app.get("/api/all_stores/settings")
+async def all_stores_settings():
+    """Return the settings catalog from the first reachable store, plus the
+    current per-store value for each setting. Used by the central tune panel
+    so Cam can see drift across stores."""
+    stores = load_stores()
+    if not stores:
+        return {"catalog": {}, "per_store": [], "error": "No stores configured"}
+
+    async def fetch_settings(client: httpx.AsyncClient, store: dict) -> dict:
+        try:
+            r = await client.get(f"{store['url'].rstrip('/')}/api/settings", timeout=TIMEOUT)
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "online": r.status_code == 200,
+                "settings": r.json() if r.status_code == 200 else None,
+            }
+        except Exception as e:
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "online": False,
+                "error": str(e)[:80],
+                "settings": None,
+            }
+
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[fetch_settings(client, s) for s in stores])
+
+    catalog = next((r["settings"] for r in results if r.get("settings")), {})
+    per_store = []
+    for r in results:
+        values = {k: r["settings"][k].get("value") for k in catalog} if r.get("settings") else {}
+        per_store.append({
+            "id": r["id"],
+            "name": r["name"],
+            "online": r["online"],
+            "values": values,
+            "error": r.get("error"),
+        })
+    return {"catalog": catalog, "per_store": per_store}
+
+
+class SettingFanout(BaseModel):
+    key: str
+    value: float
+
+
+@app.post("/api/all_stores/set_setting")
+async def set_setting_all_stores(payload: SettingFanout):
+    """Push one setting value to every store in parallel."""
+    stores = load_stores()
+    if not stores:
+        return {"results": [], "error": "No stores configured"}
+
+    async def push_one(client: httpx.AsyncClient, store: dict) -> dict:
+        base = store["url"].rstrip("/")
+        started = time.time()
+        try:
+            r = await client.put(
+                f"{base}/api/settings/{payload.key}",
+                json={"value": payload.value},
+                timeout=TIMEOUT,
+            )
+            ok = r.status_code == 200
+            body = r.json() if ok else {"detail": (r.text or "")[:200]}
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": ok,
+                "status": r.status_code,
+                "detail": None if ok else body.get("detail"),
+                "took_sec": round(time.time() - started, 2),
+            }
+        except Exception as e:
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": False,
+                "error": str(e)[:120],
+                "took_sec": round(time.time() - started, 2),
+            }
+
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[push_one(client, s) for s in stores])
+    n_ok = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "ok_count": n_ok, "total": len(results)}
+
+
+@app.post("/api/all_stores/restart_pipelines")
+async def restart_pipelines_all_stores():
+    """Hit /api/admin/restart_pipeline on every store in parallel. Needed
+    after pushing a setting that's only read at pipeline startup (like
+    reid.similarity_threshold)."""
+    stores = load_stores()
+    if not stores:
+        return {"results": [], "error": "No stores configured"}
+
+    async def restart_one(client: httpx.AsyncClient, store: dict) -> dict:
+        base = store["url"].rstrip("/")
+        started = time.time()
+        try:
+            r = await client.post(f"{base}/api/admin/restart_pipeline", timeout=15)
+            ok = r.status_code == 200
+            body = r.json() if ok else {}
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": ok and body.get("ok", False),
+                "skipped": body.get("skipped", False),
+                "took_sec": round(time.time() - started, 2),
+            }
+        except Exception as e:
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": False,
+                "error": str(e)[:120],
+                "took_sec": round(time.time() - started, 2),
+            }
+
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[restart_one(client, s) for s in stores])
     n_ok = sum(1 for r in results if r.get("ok"))
     return {"results": results, "ok_count": n_ok, "total": len(results)}
 

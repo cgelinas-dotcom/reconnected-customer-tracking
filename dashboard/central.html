@@ -70,6 +70,29 @@
     &nbsp;&nbsp;<span class="dot err"></span> Mini PC unreachable (power, internet, or Tailscale offline at that store)
   </p>
 
+  <h2 style="margin-top:40px">Tune all stores</h2>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+    Set a value and click "Push to all" — fans out to every store in parallel.
+    Some settings (like <code>reid.similarity_threshold</code>) only take effect after the pipeline restarts —
+    use the button below to restart all 8 pipelines after pushing.
+  </div>
+  <div style="margin-bottom:12px">
+    <button onclick="restartAllPipelines()" id="restart-all-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #ccc;background:#fff;cursor:pointer;font:inherit">
+      Restart pipelines on all stores
+    </button>
+    <span id="restart-status" style="font-size:13px;color:var(--muted);margin-left:8px"></span>
+  </div>
+  <table id="tune-table">
+    <thead><tr>
+      <th>Setting</th>
+      <th style="width:180px">Push value</th>
+      <th>Current value per store</th>
+      <th>Range / default</th>
+      <th></th>
+    </tr></thead>
+    <tbody><tr><td colspan="5" style="color:#999;padding:20px;text-align:center">Loading settings...</td></tr></tbody>
+  </table>
+
   <script>
     function ageStr(sec) {
       if (sec == null) return 'never';
@@ -118,7 +141,110 @@
       document.getElementById('t-employees').textContent = tEmp;
     }
     refresh();
-    setInterval(refresh, 10000);
+    loadTuneTable();
+    setInterval(() => { refresh(); loadTuneTable(); }, 10000);
+
+    async function loadTuneTable() {
+      const tbody = document.querySelector('#tune-table tbody');
+      // Don't blow away an input the user is editing
+      if (tbody && tbody.contains(document.activeElement)) return;
+      let data;
+      try {
+        const r = await fetch('/api/all_stores/settings');
+        data = await r.json();
+      } catch (e) {
+        return;
+      }
+      if (tbody && tbody.contains(document.activeElement)) return;
+      const catalog = data.catalog || {};
+      const perStore = data.per_store || [];
+      const keys = Object.keys(catalog);
+      if (!keys.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:#999;padding:20px;text-align:center">No settings catalog available (is any store online?)</td></tr>';
+        return;
+      }
+      const fmt = (s, v) => {
+        if (v == null) return '—';
+        if (s.unit === 'seconds') {
+          if (v >= 86400) return `${(v/86400).toFixed(1)}d`;
+          if (v >= 3600)  return `${(v/3600).toFixed(1)}h`;
+          if (v >= 60)    return `${(v/60).toFixed(1)}m`;
+          return `${v}s`;
+        }
+        return Number(v).toFixed(2);
+      };
+      tbody.innerHTML = keys.map(key => {
+        const s = catalog[key];
+        const step = s.unit === 'seconds' ? 60 : 0.01;
+        // Per-store badges showing the current value at each store
+        const badges = perStore.map(ps => {
+          if (!ps.online) {
+            return `<span style="display:inline-block;font-size:11px;padding:2px 6px;margin:2px;background:#fee;color:#900;border-radius:4px">${ps.name}: offline</span>`;
+          }
+          const v = ps.values[key];
+          return `<span style="display:inline-block;font-size:11px;padding:2px 6px;margin:2px;background:#f0f0f0;border-radius:4px"><strong>${ps.name}:</strong> ${fmt(s, v)}</span>`;
+        }).join('');
+        return `<tr>
+          <td><code style="font-size:12px">${key}</code><div style="font-size:11px;color:var(--muted);margin-top:4px;max-width:340px">${s.description}</div></td>
+          <td>
+            <input type="number" id="tune-${key}" min="${s.min}" max="${s.max}" step="${step}" value="${s.value}" style="width:110px;padding:5px 7px;border-radius:6px;border:1px solid #ccc;font:inherit">
+            <button onclick="pushSetting('${key}')" style="margin-top:6px;padding:6px 10px;border-radius:6px;border:1px solid #0a66c2;background:#0a66c2;color:white;cursor:pointer;font:inherit;font-size:12px">Push to all</button>
+            <div id="tune-status-${key}" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
+          </td>
+          <td>${badges}</td>
+          <td style="font-size:12px;color:var(--muted)">default ${s.default}<br>[${s.min}, ${s.max}]${s.unit ? '<br>'+s.unit : ''}</td>
+          <td></td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function pushSetting(key) {
+      const v = parseFloat(document.getElementById(`tune-${key}`).value);
+      const statusEl = document.getElementById(`tune-status-${key}`);
+      statusEl.textContent = `Pushing ${v} to all stores...`;
+      try {
+        const r = await fetch('/api/all_stores/set_setting', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({key, value: v}),
+        });
+        const d = await r.json();
+        const failed = d.results.filter(x => !x.ok);
+        if (failed.length === 0) {
+          statusEl.innerHTML = `<span style="color:var(--accent)">✓ Pushed to all ${d.total} stores</span>`;
+        } else {
+          const failList = failed.map(f => `${f.name}: ${f.error || f.detail || 'HTTP '+f.status}`).join('; ');
+          statusEl.innerHTML = `<span style="color:var(--err)">${d.ok_count}/${d.total} ok. Failed: ${failList}</span>`;
+        }
+        // Reload to show the new per-store values
+        loadTuneTable();
+      } catch (e) {
+        statusEl.innerHTML = `<span style="color:var(--err)">Error: ${e.message}</span>`;
+      }
+    }
+
+    async function restartAllPipelines() {
+      if (!confirm("Restart the pipeline scheduled task on all 8 stores? Each pipeline will come back online in ~5s with the latest settings applied.")) return;
+      const btn = document.getElementById('restart-all-btn');
+      const status = document.getElementById('restart-status');
+      btn.disabled = true; btn.style.opacity = 0.6;
+      status.textContent = 'Restarting all pipelines in parallel...';
+      try {
+        const r = await fetch('/api/all_stores/restart_pipelines', {method: 'POST'});
+        const d = await r.json();
+        const failed = d.results.filter(x => !x.ok && !x.skipped);
+        if (failed.length === 0) {
+          status.innerHTML = `<span style="color:var(--accent)">✓ Restarted ${d.ok_count}/${d.total} stores</span>`;
+        } else {
+          const failList = failed.map(f => `${f.name}: ${f.error || 'failed'}`).join('; ');
+          status.innerHTML = `<span style="color:var(--err)">${d.ok_count}/${d.total} ok. Failed: ${failList}</span>`;
+        }
+      } catch (e) {
+        status.innerHTML = `<span style="color:var(--err)">Error: ${e.message}</span>`;
+      } finally {
+        btn.disabled = false; btn.style.opacity = 1;
+      }
+    }
 
     async function pullAll() {
       if (!confirm("Pull latest code from GitHub on ALL 8 stores and restart each one's pipeline? Takes ~30 seconds in parallel.")) return;

@@ -250,8 +250,16 @@
     document.querySelector('#by-store thead tr').innerHTML =
       '<th>Store</th><th>Unique tracks</th><th>Total detections</th><th>Cameras</th>';
     async function loadSettings() {
+      // Don't blow away an input the user is editing. If focus is anywhere
+      // inside the settings table, skip this refresh tick entirely — the
+      // next tick after they tab/click out will catch back up.
+      const tbody = document.querySelector('#settings tbody');
+      if (tbody && tbody.contains(document.activeElement)) return;
       const r = await fetch('/api/settings');
       const data = await r.json();
+      // Re-check after the await — focus might have moved into a setting
+      // input while the fetch was in flight.
+      if (tbody && tbody.contains(document.activeElement)) return;
       const fmtValue = (s) => {
         if (s.unit === 'seconds') {
           const v = s.value;
