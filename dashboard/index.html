@@ -404,9 +404,12 @@
     document.getElementById('live-view-enabled').addEventListener('change', (e) => {
       liveViewSetEnabled(e.target.checked);
     });
-    // Re-load camera list when the <details> is opened (cameras may have changed)
-    document.getElementById('live-view-details').addEventListener('toggle', (e) => {
-      if (e.target.open && !liveViewCameras.length) liveViewLoadCameras();
+    // Opening the section: load camera list + immediately fetch one frame.
+    // Auto-refresh checkbox only controls whether it keeps polling after that.
+    document.getElementById('live-view-details').addEventListener('toggle', async (e) => {
+      if (!e.target.open) return;
+      if (!liveViewCameras.length) await liveViewLoadCameras();
+      liveViewTick();
     });
 
     async function adminRefreshSnapshots() {
