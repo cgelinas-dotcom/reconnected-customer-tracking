@@ -36,8 +36,18 @@ try:
 except Exception:
     _OSNET_AVAILABLE = False
 
-MODEL_NAME = "osnet_x0_25_msmt17" if _OSNET_AVAILABLE else "resnet18_imagenet"
-EMBEDDING_DIM = 512  # both OSNet x0_25 and ResNet18 (head stripped) produce 512-dim
+# OSNet model size — x1_0 is the full-size model (~10x more parameters than
+# the tiny x0_25 we started with). Materially more accurate at recognizing the
+# same person across days, lighting, and clothing changes. CPU cost is ~2-3x.
+# Override via env var REID_MODEL if you want to experiment, e.g.
+#   REID_MODEL=osnet_x0_25_msmt17    (tiny, fast, less accurate — original default)
+#   REID_MODEL=osnet_x0_5_msmt17     (medium)
+#   REID_MODEL=osnet_x1_0_msmt17     (full size — current default)
+#   REID_MODEL=osnet_ain_x1_0_msmt17 (full size with instance norm — even more robust)
+import os as _os
+_REID_MODEL = _os.environ.get("REID_MODEL", "osnet_x1_0_msmt17")
+MODEL_NAME = _REID_MODEL if _OSNET_AVAILABLE else "resnet18_imagenet"
+EMBEDDING_DIM = 512  # all OSNet variants and ResNet18 (head stripped) produce 512-dim
 
 
 def _pick_device() -> torch.device:
@@ -51,15 +61,17 @@ def _pick_device() -> torch.device:
 def _load_osnet() -> None:
     """Load OSNet via boxmot. Auto-downloads weights on first use."""
     global _boxmot_reid, _device
+    from pathlib import Path as _Path
     _device = _pick_device()
-    # Pass path=None so boxmot uses its default osnet_x0_25_msmt17.pt and
-    # downloads it to its weights cache (~/.cache/boxmot/weights/) on first use.
+    # Build the weights path from MODEL_NAME so boxmot picks the right model.
+    weights_path = _Path.home() / ".cache" / "boxmot" / "weights" / f"{MODEL_NAME}.pt"
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
     _boxmot_reid = _BoxmotReID(
-        path=None,
+        path=weights_path,
         device=str(_device),
         half=False,
     )
-    print(f"[reid] loaded OSNet x0_25 via boxmot (purpose-built for person re-ID) on device={_device}")
+    print(f"[reid] loaded {MODEL_NAME} via boxmot (purpose-built for person re-ID) on device={_device}")
 
 
 def _load_resnet18() -> None:
