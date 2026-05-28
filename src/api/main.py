@@ -992,18 +992,23 @@ def admin_git_pull():
     if git_exe is None:
         return {"ok": False, "pull": "git executable not found in PATH or known locations", "restart": None}
 
-    # Disable interactive credential prompts (otherwise git hangs forever when
-    # running under SYSTEM user with no credential helper). For public repos
-    # we never need auth.
+    # Aggressively disable anything that could cause git to hang on credentials.
+    # Under SYSTEM user, a configured credential helper (like Git Credential
+    # Manager from gh CLI) can pop up a GUI dialog that never appears, so the
+    # subprocess hangs forever. We force credential.helper to empty for this
+    # command and disable interactive prompts.
     import os as _os
     env = _os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_ASKPASS"] = "echo"  # any failed prompt just gets "echo" and fails fast
     env["GCM_INTERACTIVE"] = "Never"
+    env.pop("GIT_ASKPASS", None)  # don't set this — "echo" can cause its own hangs
 
     try:
         r = subprocess.run(
-            [git_exe, "-C", str(ROOT), "pull"],
+            [git_exe, "-C", str(ROOT),
+             "-c", "credential.helper=",     # clear any configured helper
+             "-c", "core.askpass=true",      # no-op askpass
+             "pull"],
             capture_output=True, text=True, timeout=30,
             env=env,
         )
