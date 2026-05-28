@@ -899,6 +899,74 @@ def admin_restart_pipeline():
     return {"ok": True, "log": "\n".join(out)}
 
 
+@app.get("/api/admin/health")
+def admin_health():
+    """Health check used by the central dashboard. Returns:
+    - nvr_reachable: TCP-connect test to each configured NVR (distinguishes
+      "NVR is down" from "everything is up")
+    - last_detection_ts: most recent row in the detections table
+    - last_detection_age_sec: seconds since that detection
+    - pipeline_task_status: state of the Windows scheduled task (if Windows)
+    """
+    import socket
+    import yaml
+    out: dict = {
+        "ok": True,
+        "now_ts": time.time(),
+        "nvrs": [],
+        "last_detection_ts": None,
+        "last_detection_age_sec": None,
+        "pipeline_task_status": None,
+    }
+    # NVR reachability
+    if CONFIG_PATH.exists():
+        try:
+            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            for store in cfg.get("stores", []):
+                nvr = store.get("nvr", {})
+                host = nvr.get("host")
+                port = int(nvr.get("port", 554))
+                if not host:
+                    continue
+                reachable = False
+                try:
+                    with socket.create_connection((host, port), timeout=2):
+                        reachable = True
+                except Exception:
+                    reachable = False
+                out["nvrs"].append({"host": host, "port": port, "reachable": reachable})
+        except Exception as e:
+            out["config_error"] = str(e)
+
+    # Last detection age
+    if DB_PATH.exists():
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM detections"
+                ).fetchone()
+                if row and row[0]:
+                    out["last_detection_ts"] = row[0]
+                    out["last_detection_age_sec"] = time.time() - row[0]
+        except Exception:
+            pass
+
+    # Pipeline scheduled task status (Windows)
+    import sys
+    if sys.platform == "win32":
+        import subprocess
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", "CustomerTracking_Pipeline", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            # CSV: "TaskName","Next Run Time","Status"
+            parts = [p.strip('"') for p in r.stdout.strip().split(",")]
+            if len(parts) >= 3:
+                out["pipeline_task_status"] = parts[2]
+    return out
+
+
 @app.post("/api/admin/git_pull")
 def admin_git_pull():
     """Run `git pull` in the project root, then restart the pipeline."""

@@ -23,10 +23,12 @@
     .err { color: var(--err); }
     a { color: #0a66c2; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 6px; }
-    .dot.green { background: var(--accent); }
-    .dot.red { background: var(--err); }
-    .dot.gray { background: #999; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; margin-right: 6px; }
+    .dot.ok { background: var(--accent); }
+    .dot.warn { background: var(--warn); }
+    .dot.stale { background: #888; }
+    .dot.err { background: var(--err); animation: pulse-red 1.6s ease-in-out infinite; }
+    @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
   </style>
 </head>
 <body>
@@ -44,18 +46,32 @@
   <table id="per-store">
     <thead><tr>
       <th></th><th>Store</th>
+      <th>Status</th>
       <th class="num">Customers today</th>
       <th class="num">Door IN today</th>
       <th class="num">Door OUT today</th>
       <th class="num">All-time persons</th>
       <th class="num">Employees tagged</th>
-      <th>Last response</th>
       <th></th>
     </tr></thead>
     <tbody><tr><td colspan="9" style="color:#999;padding:20px;text-align:center">Loading...</td></tr></tbody>
   </table>
 
+  <p style="margin-top:24px;font-size:12px;color:var(--muted)">
+    <span class="dot ok"></span> All good
+    &nbsp;&nbsp;<span class="dot warn"></span> Partial issue (e.g. one NVR down)
+    &nbsp;&nbsp;<span class="dot stale"></span> No detections in 4+ hours (during business hours = possible camera issue)
+    &nbsp;&nbsp;<span class="dot err"></span> Mini PC unreachable (power, internet, or Tailscale offline at that store)
+  </p>
+
   <script>
+    function ageStr(sec) {
+      if (sec == null) return 'never';
+      if (sec < 60) return `${Math.round(sec)}s ago`;
+      if (sec < 3600) return `${Math.round(sec/60)}m ago`;
+      if (sec < 86400) return `${(sec/3600).toFixed(1)}h ago`;
+      return `${(sec/86400).toFixed(1)}d ago`;
+    }
     async function refresh() {
       const r = await fetch('/api/all_stores');
       const data = await r.json();
@@ -69,16 +85,23 @@
           tEmp += s.stats?.employees_count || 0;
           online++;
         }
-        const dot = ok ? 'green' : 'red';
+        const dotClass = s.status === 'ok' ? 'ok'
+                       : s.status === 'warn' ? 'warn'
+                       : s.status === 'stale' ? 'stale'
+                       : 'err';
+        const lastDet = s.health?.last_detection_age_sec;
         return `<tr>
-          <td><span class="dot ${dot}"></span></td>
+          <td><span class="dot ${dotClass}"></span></td>
           <td><strong>${s.name}</strong><br><span style="font-size:11px;color:var(--muted)">${s.id}</span></td>
+          <td style="font-size:12px">
+            <div>${s.status_detail || '—'}</div>
+            ${ok ? `<div style="color:var(--muted);font-size:11px;margin-top:2px">Last detection: ${ageStr(lastDet)} · ${s.latency_ms}ms</div>` : ''}
+          </td>
           <td class="num">${ok ? (s.entry?.unique_customers ?? '—') : '—'}</td>
           <td class="num">${ok ? (s.entry?.customer_crossings_in ?? '—') : '—'}</td>
           <td class="num">${ok ? (s.entry?.total_crossings_out ?? '—') : '—'}</td>
           <td class="num">${ok ? (s.stats?.unique_persons ?? '—') : '—'}</td>
           <td class="num">${ok ? (s.stats?.employees_count ?? '—') : '—'}</td>
-          <td style="font-size:12px;color:${ok ? '#666' : 'var(--err)'}">${ok ? s.latency_ms + ' ms' : (s.error || 'offline')}</td>
           <td><a href="${s.url}" target="_blank">Open →</a></td>
         </tr>`;
       }).join('');

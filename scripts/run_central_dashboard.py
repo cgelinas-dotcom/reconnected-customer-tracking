@@ -54,19 +54,41 @@ async def _fetch_store(client: httpx.AsyncClient, store: dict) -> dict:
     base = store["url"].rstrip("/")
     started = time.time()
     try:
-        r1, r2 = await asyncio.gather(
+        r1, r2, r3 = await asyncio.gather(
             client.get(f"{base}/api/entry_stats", timeout=TIMEOUT),
             client.get(f"{base}/api/stats", timeout=TIMEOUT),
+            client.get(f"{base}/api/admin/health", timeout=TIMEOUT),
             return_exceptions=True,
         )
         entry = r1.json() if isinstance(r1, httpx.Response) and r1.status_code == 200 else None
         stats_raw = r2.json() if isinstance(r2, httpx.Response) and r2.status_code == 200 else None
+        health = r3.json() if isinstance(r3, httpx.Response) and r3.status_code == 200 else None
         stats = None
         if stats_raw:
             stats = {
                 "unique_persons": stats_raw.get("unique_persons") or stats_raw.get("unique_tracks"),
                 "employees_count": stats_raw.get("employees_count") or 0,
             }
+
+        # Distill health into a single status label + summary
+        status = "ok"
+        status_detail = []
+        if health:
+            nvr_states = health.get("nvrs", [])
+            if nvr_states and not any(n.get("reachable") for n in nvr_states):
+                status = "nvr-down"
+                status_detail.append("NVR unreachable")
+            elif nvr_states and not all(n.get("reachable") for n in nvr_states):
+                status = "warn"
+                status_detail.append("Some NVRs unreachable")
+            age = health.get("last_detection_age_sec")
+            if age is None:
+                status_detail.append("No detections recorded yet")
+            elif age > 14400:  # 4 hours
+                if status == "ok":
+                    status = "stale"
+                status_detail.append(f"No detection in {int(age/60)} min")
+
         latency_ms = int((time.time() - started) * 1000)
         return {
             "id": store.get("id"),
@@ -75,6 +97,9 @@ async def _fetch_store(client: httpx.AsyncClient, store: dict) -> dict:
             "online": True,
             "entry": entry if entry and "error" not in entry else None,
             "stats": stats,
+            "health": health,
+            "status": status,
+            "status_detail": " · ".join(status_detail) if status_detail else "All good",
             "latency_ms": latency_ms,
         }
     except Exception as e:
@@ -83,6 +108,8 @@ async def _fetch_store(client: httpx.AsyncClient, store: dict) -> dict:
             "name": store.get("name", store.get("id")),
             "url": store["url"],
             "online": False,
+            "status": "offline",
+            "status_detail": "Mini PC unreachable — power/internet/Tailscale issue",
             "error": str(e)[:60],
         }
 

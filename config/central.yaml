@@ -1,0 +1,35 @@
+# Copy to central.yaml on the machine that runs the central dashboard
+# (typically your Mac). Lists each store's Tailscale IP so the central
+# dashboard can fan out queries to all of them.
+#
+# After copying:
+#   cp config/central.example.yaml config/central.yaml
+#   # edit to add real IPs (Tailscale admin UI lists them)
+#   python scripts/run_central_dashboard.py
+#   # then open http://localhost:8080
+
+stores:
+  - id: anthem
+    name: "Anthem"
+    url: "http://100.112.30.28:8000"
+  - id: bullhead
+    name: "Bullhead"
+    url: "http://100.87.144.54:8000"
+  - id: havasu
+    name: "Lake Havasu"
+    url: "http://100.121.179.110:8000"
+  - id: kingman
+    name: "Kingman"
+    url: "http://100.94.53.79:8000"
+  - id: paradisevalley
+    name: "Paradise Valley"
+    url: "http://100.69.36.117:8000"
+  - id: tolleson
+    name: "Tolleson"
+    url: "http://100.73.79.39:8000"
+  - id: prescott
+    name: "Prescott"
+    url: "http://100.86.248.52:8000"
+  - id: fountainhills
+    name: "Fountain Hills"
+    url: "http://100.103.71.39:8000"
