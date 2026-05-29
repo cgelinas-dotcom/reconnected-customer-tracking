@@ -279,12 +279,13 @@ def main() -> int:
         registry = load_registry_from_db(db, active_model=REID_MODEL_NAME)
         registry.similarity_threshold = reid_threshold
         registry.recency_window_sec = reid_window
-        # pre-load existing track->person mappings for this store/camera
-        for tid, pid in db.execute(
-            "SELECT track_id, person_id FROM track_persons WHERE store_id=? AND camera_id=?",
-            (store_id, camera_id),
-        ).fetchall():
-            track_to_person[tid] = pid
+        # Do NOT pre-load track->person from DB. ByteTrack restarts its
+        # track_id counter from 1 on every pipeline restart — those numbers
+        # carry no meaning across runs. Pre-loading would silently map
+        # today's new track_id 1 to yesterday's person_id, skipping OSNet
+        # entirely and corrupting unique-customer counts. Cross-restart
+        # continuity is OSNet's job (via embedding similarity), not
+        # ByteTrack's integer IDs.
 
     unique_tracks: set[int] = set()
     unique_persons: set[int] = set()
