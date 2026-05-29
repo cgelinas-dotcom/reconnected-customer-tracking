@@ -63,6 +63,70 @@ MODEL_NAME = "yolov8n.pt"
 PERSON_CLASS_ID = 0
 
 
+def is_quality_box(x1: float, y1: float, x2: float, y2: float, conf: float,
+                   frame_w: int, frame_h: int,
+                   other_boxes: list, my_idx: int,
+                   min_h: int, min_w: int, min_conf: float,
+                   edge_margin: int, max_occlusion_iou: float) -> tuple[bool, str]:
+    """Decide whether a detection box is good enough to embed for re-ID.
+    Returns (is_quality, reason_if_not). Used to refuse garbage crops
+    (frame-edge, tiny, occluded, low-confidence) instead of letting them
+    pollute a person's fingerprint."""
+    bh = y2 - y1
+    bw = x2 - x1
+    if bh < min_h:
+        return False, f"too short ({bh:.0f}px)"
+    if bw < min_w:
+        return False, f"too narrow ({bw:.0f}px)"
+    if conf < min_conf:
+        return False, f"low conf ({conf:.2f})"
+    if (x1 < edge_margin or y1 < edge_margin or
+            x2 > frame_w - edge_margin or y2 > frame_h - edge_margin):
+        return False, "frame edge"
+    # Occlusion check against other detections in the same frame
+    my_area = max(1.0, bh * bw)
+    for j, (ox1, oy1, ox2, oy2) in enumerate(other_boxes):
+        if j == my_idx:
+            continue
+        ix1, iy1 = max(x1, ox1), max(y1, oy1)
+        ix2, iy2 = min(x2, ox2), min(y2, oy2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        if inter / my_area > max_occlusion_iou:
+            return False, f"occluded {inter/my_area:.0%}"
+    return True, ""
+
+
+def color_signature(crop) -> list:
+    """Cheap dominant-color signature: HSV histogram of the torso region
+    (middle vertical third of the crop, which is most likely shirt/jacket).
+    Returned as a 16-bin normalized list. Used as a same-day tiebreaker
+    for OSNet matches."""
+    import cv2
+    import numpy as np
+    if crop is None or crop.size == 0:
+        return [0.0] * 16
+    h = crop.shape[0]
+    torso = crop[h // 3: 2 * h // 3]
+    if torso.size == 0:
+        return [0.0] * 16
+    hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0], None, [16], [0, 180]).flatten()
+    s = float(hist.sum())
+    return (hist / s).tolist() if s > 0 else [0.0] * 16
+
+
+def average_embeddings(embs: list):
+    """L2-normalized mean of a list of unit embeddings."""
+    import numpy as np
+    if not embs:
+        return None
+    avg = np.mean(np.stack(embs, axis=0), axis=0)
+    n = float(np.linalg.norm(avg))
+    return (avg / n) if n > 0 else avg
+
+
 def parse_source(arg: str):
     if arg.isdigit():
         return int(arg), "webcam"
@@ -296,12 +360,25 @@ def main() -> int:
     detections = 0
     start = time.time()
     last_live_write_ts = 0.0  # for the live-view JPEG throttle
-    # Per-track frame counter for periodic re-embedding. Embedding once at
-    # first sighting (a single shaky frame) is the main cause of re-ID
-    # fragmentation; refreshing every N frames builds a stable averaged
-    # fingerprint per person.
+
+    # ----- Phase 2.1 re-ID state -----
+    # Per-track frame counter for periodic re-embedding.
     track_frames: dict[int, int] = {}
     REID_REEMBED_EVERY = 30  # ~3 sec at 10fps processed
+
+    # Multi-shot first embedding: accumulate quality embeddings until we have
+    # enough to average into a stable first fingerprint. Skips bad-crop tracks
+    # entirely instead of locking in a doorway-edge half-glimpse.
+    track_warmup_embeds: dict[int, list] = {}  # tid -> list of embeddings
+    track_warmup_colors: dict[int, list] = {}  # tid -> list of color signatures
+    MIN_QUALITY_EMBEDS_FOR_ASSIGN = 3  # average this many before deciding identity
+
+    # Quality crop thresholds — refuse to embed garbage frames.
+    QUALITY_MIN_BBOX_HEIGHT = 80         # pixels — anything smaller is too low-detail
+    QUALITY_MIN_BBOX_WIDTH = 30          # pixels
+    QUALITY_MIN_CONFIDENCE = 0.6         # YOLO confidence floor
+    QUALITY_EDGE_MARGIN = 8              # pixels — boxes within this of frame edge are partial views
+    QUALITY_MAX_OCCLUSION_IOU = 0.3      # if another detection overlaps more than this, the crop is occluded
 
     try:
         while True:
@@ -340,7 +417,9 @@ def main() -> int:
                 confs = r.boxes.conf.cpu().numpy()
 
                 rows = []
-                for (x1, y1, x2, y2), tid, conf in zip(boxes, ids, confs):
+                # Materialize boxes list so we can check occlusion within frame
+                box_list = [(float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in boxes]
+                for box_idx, ((x1, y1, x2, y2), tid, conf) in enumerate(zip(boxes, ids, confs)):
                     tid = int(tid)
                     unique_tracks.add(tid)
                     rows.append((ts, store_id, camera_id, tid,
@@ -348,41 +427,63 @@ def main() -> int:
 
                     pid_label = ""
                     if reid_enabled:
-                        # Embed on first sighting of a track AND periodically
-                        # afterward. Each subsequent embedding gets averaged
-                        # into the stored person's fingerprint via
-                        # Person.update(), so the saved representation
-                        # stabilizes across many views instead of being
-                        # one shaky entering-frame snapshot.
                         track_frames[tid] = track_frames.get(tid, 0) + 1
                         is_first_sighting = tid not in track_to_person
                         is_periodic_refresh = (
                             not is_first_sighting
                             and track_frames[tid] % REID_REEMBED_EVERY == 0
                         )
+
                         if is_first_sighting or is_periodic_refresh:
-                            x1i, y1i = max(0, int(x1)), max(0, int(y1))
-                            x2i, y2i = min(w, int(x2)), min(h, int(y2))
-                            crop = frame[y1i:y2i, x1i:x2i]
-                            if crop.size > 0:
-                                emb = embed_crop(crop)
-                                if is_first_sighting:
-                                    pid, sim = registry.assign(emb, ts, store_id, camera_id)
-                                    track_to_person[tid] = pid
-                                    db.execute(
-                                        "INSERT OR REPLACE INTO track_persons "
-                                        "(store_id, camera_id, track_id, person_id, match_sim, assigned_ts) "
-                                        "VALUES (?, ?, ?, ?, ?, ?)",
-                                        (store_id, camera_id, tid, pid, sim, ts),
-                                    )
-                                    persist_person(db, registry.persons[pid])
-                                    match_note = f"matched sim={sim:.2f}" if sim is not None else "new"
-                                    print(f"  [reid] track {tid} -> person {pid} ({match_note})")
-                                else:
-                                    pid = track_to_person[tid]
-                                    if pid in registry.persons:
-                                        registry.persons[pid].update(emb, ts)
-                                        persist_person(db, registry.persons[pid])
+                            # Quality gate: refuse to embed garbage crops
+                            quality_ok, why = is_quality_box(
+                                float(x1), float(y1), float(x2), float(y2), float(conf),
+                                w, h, box_list, box_idx,
+                                QUALITY_MIN_BBOX_HEIGHT, QUALITY_MIN_BBOX_WIDTH,
+                                QUALITY_MIN_CONFIDENCE, QUALITY_EDGE_MARGIN,
+                                QUALITY_MAX_OCCLUSION_IOU,
+                            )
+                            if quality_ok:
+                                x1i, y1i = max(0, int(x1)), max(0, int(y1))
+                                x2i, y2i = min(w, int(x2)), min(h, int(y2))
+                                crop = frame[y1i:y2i, x1i:x2i]
+                                if crop.size > 0:
+                                    emb = embed_crop(crop)
+                                    csig = color_signature(crop)
+
+                                    if is_first_sighting:
+                                        # Multi-shot first embedding: accumulate
+                                        # quality samples until we have enough,
+                                        # then average and decide identity.
+                                        track_warmup_embeds.setdefault(tid, []).append(emb)
+                                        track_warmup_colors.setdefault(tid, []).append(csig)
+                                        if len(track_warmup_embeds[tid]) >= MIN_QUALITY_EMBEDS_FOR_ASSIGN:
+                                            avg_emb = average_embeddings(track_warmup_embeds[tid])
+                                            pid, sim = registry.assign(avg_emb, ts, store_id, camera_id)
+                                            track_to_person[tid] = pid
+                                            db.execute(
+                                                "INSERT OR REPLACE INTO track_persons "
+                                                "(store_id, camera_id, track_id, person_id, match_sim, assigned_ts) "
+                                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                                (store_id, camera_id, tid, pid, sim, ts),
+                                            )
+                                            persist_person(db, registry.persons[pid])
+                                            match_note = (
+                                                f"matched sim={sim:.2f}"
+                                                if sim is not None else "new"
+                                            )
+                                            n_samples = len(track_warmup_embeds[tid])
+                                            print(f"  [reid] track {tid} -> person {pid} "
+                                                  f"({match_note}, multi-shot from {n_samples} crops)")
+                                            # Free warmup memory now that we've committed
+                                            track_warmup_embeds.pop(tid, None)
+                                            track_warmup_colors.pop(tid, None)
+                                    else:
+                                        # Periodic refresh of an existing assignment
+                                        pid = track_to_person[tid]
+                                        if pid in registry.persons:
+                                            registry.persons[pid].update(emb, ts)
+                                            persist_person(db, registry.persons[pid])
                     if reid_enabled:
                         pid = track_to_person.get(tid)
                         if pid is not None:

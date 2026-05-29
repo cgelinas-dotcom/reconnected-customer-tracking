@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.88  # tuned for OSNet; ResNet18 wants ~0.78
-DEFAULT_RECENCY_WINDOW_SEC = 43200  # 12 hours
+DEFAULT_RECENCY_WINDOW_SEC = 2592000  # 30 days — enables cross-day returning-customer matching
 
 
 @dataclass

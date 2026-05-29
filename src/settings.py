@@ -34,9 +34,10 @@ DEFAULTS: dict[str, SettingSpec] = {
         unit="",
     ),
     "reid.recency_window_sec": SettingSpec(
-        default=43200, min=300, max=2592000,  # 5 min .. 30 days
+        default=2592000, min=300, max=2592000,  # 5 min .. 30 days, default 30 days
         description="How far back to look when matching a new track to existing persons. "
-                    "Set high (e.g. 604800 = 7 days) if you want returning-customer detection across days.",
+                    "Default 30 days enables returning-customer detection across the month. "
+                    "Drop to 86400 (1 day) if you only want same-day matching.",
         unit="seconds",
     ),
     "visits.session_timeout_sec": SettingSpec(
