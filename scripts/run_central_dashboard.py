@@ -285,13 +285,25 @@ async def wipe_all_stores():
                 timeout=20,
             )
             ok = r.status_code == 200
-            body = r.json() if ok else {}
+            body = {}
+            err = None
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            if not ok:
+                if r.status_code == 404:
+                    err = "HTTP 404 — store dashboard doesn't have /api/admin/wipe_data yet. Pull latest code first."
+                else:
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                    err = f"HTTP {r.status_code}" + (f": {detail}" if detail else f": {r.text[:120]}")
             return {
                 "id": store.get("id"),
                 "name": store.get("name"),
                 "ok": ok,
-                "deleted": body.get("deleted", {}),
-                "restart": body.get("restart"),
+                "deleted": body.get("deleted", {}) if ok else {},
+                "restart": body.get("restart") if ok else None,
+                "error": err,
                 "took_sec": round(time.time() - started, 2),
             }
         except Exception as e:
@@ -299,7 +311,7 @@ async def wipe_all_stores():
                 "id": store.get("id"),
                 "name": store.get("name"),
                 "ok": False,
-                "error": str(e)[:120],
+                "error": f"{type(e).__name__}: {str(e)[:120]}",
                 "took_sec": round(time.time() - started, 2),
             }
 
