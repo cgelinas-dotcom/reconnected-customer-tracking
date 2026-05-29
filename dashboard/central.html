@@ -35,9 +35,11 @@
   <h1>Customer Tracking — All Stores</h1>
   <div class="subtitle">Aggregating live from each store's mini PC. Auto-refreshes every 10s.</div>
 
-  <div style="margin-bottom:20px;display:flex;gap:8px;align-items:center">
+  <div style="margin-bottom:20px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <button onclick="pullAll()" id="pull-all-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #ccc;background:#0a66c2;color:white;cursor:pointer;font:inherit;font-weight:600">⬇️ Pull from GitHub + restart all stores</button>
+    <button onclick="wipeAll()" id="wipe-all-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #b91c1c;background:#fff;color:#b91c1c;cursor:pointer;font:inherit;font-weight:600">⚠️ Wipe all data — start fresh on all stores</button>
     <span id="pull-status" style="font-size:13px;color:var(--muted)"></span>
+    <span id="wipe-status" style="font-size:13px;color:var(--muted)"></span>
   </div>
   <pre id="pull-log" style="display:none;font-size:11px;background:#000;color:#0f0;padding:10px;border-radius:6px;max-height:300px;overflow:auto;white-space:pre-wrap;margin-bottom:20px"></pre>
 
@@ -241,6 +243,50 @@
         }
       } catch (e) {
         status.innerHTML = `<span style="color:var(--err)">Error: ${e.message}</span>`;
+      } finally {
+        btn.disabled = false; btn.style.opacity = 1;
+      }
+    }
+
+    async function wipeAll() {
+      // Two-step confirmation because this is destructive
+      const c1 = confirm(
+        "DESTRUCTIVE ACTION\n\n" +
+        "This will DELETE all of the following on ALL 8 stores:\n" +
+        "  - All person re-ID records (every P number ever assigned)\n" +
+        "  - All track→person mappings\n" +
+        "  - All detection logs\n" +
+        "  - All entry/exit events (door crossings)\n" +
+        "  - All visit sessions\n" +
+        "  - All manually-tagged employees (Gary, Anthony etc)\n\n" +
+        "Kept: tuned settings (similarity threshold etc).\n\n" +
+        "All 8 store pipelines and dashboards will restart.\n\n" +
+        "Continue?"
+      );
+      if (!c1) return;
+      const c2 = prompt('Type the word WIPE to confirm:');
+      if (c2 !== 'WIPE') {
+        alert('Cancelled.');
+        return;
+      }
+      const btn = document.getElementById('wipe-all-btn');
+      const status = document.getElementById('wipe-status');
+      const log = document.getElementById('pull-log');
+      btn.disabled = true; btn.style.opacity = 0.6;
+      status.textContent = 'Wiping all 8 stores in parallel...';
+      log.style.display = 'block'; log.textContent = '';
+      try {
+        const r = await fetch('/api/all_stores/wipe_data', {method: 'POST'});
+        const d = await r.json();
+        status.textContent = `Wiped ${d.ok_count} / ${d.total} stores`;
+        log.textContent = d.results.map(r => {
+          if (!r.ok) return `=== ${r.name} (${r.id}) — ✗ FAILED (${r.took_sec}s) ===\nerror: ${r.error || 'unknown'}\n`;
+          const counts = Object.entries(r.deleted)
+            .map(([t, n]) => `  ${t}: ${n}`).join('\n');
+          return `=== ${r.name} (${r.id}) — ✓ OK (${r.took_sec}s) ===\n--- deleted rows ---\n${counts}\n--- restart ---\n${r.restart || ''}\n`;
+        }).join('\n');
+      } catch (e) {
+        status.textContent = `Error: ${e.message}`;
       } finally {
         btn.disabled = false; btn.style.opacity = 1;
       }

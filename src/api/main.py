@@ -915,6 +915,73 @@ def admin_live_frame(camera_name: str):
     )
 
 
+class WipeRequest(BaseModel):
+    confirm: str = ""  # must be the literal string "yes" to proceed
+
+
+@app.post("/api/admin/wipe_data")
+def admin_wipe_data(payload: WipeRequest):
+    """Destructive: clears all re-ID / detection / entry data so the store
+    starts fresh. Preserves the settings table (tuned threshold, recency
+    window, etc) and then triggers a detached pipeline + dashboard restart
+    so the in-memory PersonRegistry also resets.
+
+    Requires explicit {"confirm": "yes"} in the body to avoid accidental
+    curl. Returns per-table delete counts."""
+    import sys
+    import subprocess
+    if payload.confirm != "yes":
+        raise HTTPException(400, 'Body must include {"confirm": "yes"}')
+
+    tables_to_clear = [
+        "entry_events",     # line crossings IN/OUT
+        "track_persons",    # track -> person mappings
+        "visits",           # coalesced visit sessions
+        "detections",       # every YOLO detection logged
+        "employees",        # manual employee tags (reference person_ids being wiped)
+        "persons",          # the re-ID person registry
+    ]
+    deleted: dict = {}
+    with db() as conn:
+        for tbl in tables_to_clear:
+            try:
+                cur = conn.execute(f"DELETE FROM {tbl}")
+                deleted[tbl] = cur.rowcount
+            except Exception as e:
+                deleted[tbl] = f"error: {type(e).__name__}: {e}"
+        try:
+            conn.execute("VACUUM")
+        except Exception:
+            pass
+        conn.commit()
+
+    # Trigger a detached restart so pipeline + dashboard reload with empty registries
+    restart_msg = "Wipe complete (no restart — not on Windows)"
+    if sys.platform == "win32":
+        ps_script = (
+            "Start-Sleep -Seconds 2; "
+            "Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; "
+            "Start-Sleep -Seconds 2; "
+            "schtasks /Run /TN CustomerTracking_Pipeline | Out-Null; "
+            "schtasks /Run /TN CustomerTracking_Dashboard | Out-Null"
+        )
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
+            restart_msg = "Pipeline + dashboard restart scheduled in 2s — back online in ~5s with empty registry"
+        except Exception as e:
+            restart_msg = f"Restart spawn failed: {type(e).__name__}: {e}"
+    return {"ok": True, "deleted": deleted, "restart": restart_msg}
+
+
 @app.post("/api/admin/restart_pipeline")
 def admin_restart_pipeline():
     """Restart BOTH the pipeline AND the dashboard processes. Same detached

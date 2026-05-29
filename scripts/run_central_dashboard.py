@@ -265,6 +265,50 @@ async def set_setting_all_stores(payload: SettingFanout):
     return {"results": results, "ok_count": n_ok, "total": len(results)}
 
 
+@app.post("/api/all_stores/wipe_data")
+async def wipe_all_stores():
+    """Destructive: hit /api/admin/wipe_data on every store in parallel.
+    Clears persons / track_persons / detections / entry_events / visits /
+    employees at each store, preserves settings, restarts pipeline+dashboard.
+    Use this after big code changes to start fresh from a clean baseline."""
+    stores = load_stores()
+    if not stores:
+        return {"results": [], "error": "No stores configured"}
+
+    async def wipe_one(client: httpx.AsyncClient, store: dict) -> dict:
+        base = store["url"].rstrip("/")
+        started = time.time()
+        try:
+            r = await client.post(
+                f"{base}/api/admin/wipe_data",
+                json={"confirm": "yes"},
+                timeout=20,
+            )
+            ok = r.status_code == 200
+            body = r.json() if ok else {}
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": ok,
+                "deleted": body.get("deleted", {}),
+                "restart": body.get("restart"),
+                "took_sec": round(time.time() - started, 2),
+            }
+        except Exception as e:
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": False,
+                "error": str(e)[:120],
+                "took_sec": round(time.time() - started, 2),
+            }
+
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[wipe_one(client, s) for s in stores])
+    n_ok = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "ok_count": n_ok, "total": len(results)}
+
+
 @app.post("/api/all_stores/restart_pipelines")
 async def restart_pipelines_all_stores():
     """Hit /api/admin/restart_pipeline on every store in parallel. Needed
