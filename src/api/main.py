@@ -429,6 +429,73 @@ def merge_persons(payload: MergeRequest):
     }
 
 
+@app.get("/api/persons/{pid}/closest")
+def person_closest_neighbors(pid: int, top: int = 10):
+    """Diagnostic: return the top-N other persons most similar to this one,
+    with their cosine similarity scores. Useful for figuring out why auto-merge
+    isn't collapsing two P numbers that you know are the same person — if the
+    sim is below threshold, the system literally cannot tell they're the same."""
+    import numpy as np
+    if not DB_PATH.exists():
+        raise HTTPException(404, "DB doesn't exist yet")
+    with db() as conn:
+        target_row = conn.execute(
+            "SELECT person_id, embedding, first_store, embedding_model "
+            "FROM persons WHERE person_id = ?", (pid,)
+        ).fetchone()
+        if not target_row:
+            raise HTTPException(404, f"Person P{pid} not found")
+        target_emb = np.frombuffer(target_row[1], dtype=np.float32)
+        target_store = target_row[2]
+        target_model = target_row[3]
+        all_rows = conn.execute(
+            "SELECT person_id, embedding, first_store, embedding_model, "
+            "first_seen_ts, last_seen_ts, n_samples FROM persons WHERE person_id != ?",
+            (pid,),
+        ).fetchall()
+
+    neighbors = []
+    for r in all_rows:
+        other_pid, emb_blob, store, model, first_ts, last_ts, n_samples = r
+        try:
+            other_emb = np.frombuffer(emb_blob, dtype=np.float32)
+            if other_emb.shape != target_emb.shape:
+                continue
+            sim = float(np.dot(target_emb, other_emb))
+        except Exception:
+            continue
+        neighbors.append({
+            "person_id": other_pid,
+            "similarity": round(sim, 4),
+            "same_store": store == target_store,
+            "same_model": model == target_model,
+            "first_seen_ts": first_ts,
+            "last_seen_ts": last_ts,
+            "n_samples": n_samples,
+        })
+    neighbors.sort(key=lambda n: -n["similarity"])
+
+    # Get the auto-merge threshold for context
+    from src import settings as settings_mod
+    with db() as conn:
+        try:
+            auto_merge_threshold = float(settings_mod.get(conn, "reid.auto_merge_threshold"))
+        except Exception:
+            auto_merge_threshold = 0.80
+
+    return {
+        "target_person_id": pid,
+        "target_store": target_store,
+        "target_n_samples": target_row[1] and int.from_bytes(b'', 'little'),  # placeholder
+        "auto_merge_threshold": auto_merge_threshold,
+        "neighbors": neighbors[:top],
+        "would_auto_merge_with": [
+            n["person_id"] for n in neighbors
+            if n["similarity"] >= auto_merge_threshold and n["same_store"] and n["same_model"]
+        ],
+    }
+
+
 class ScanMergeRequest(BaseModel):
     threshold: float | None = None  # None = use reid.auto_merge_threshold setting
     dry_run: bool = False           # if True, report groups but don't actually merge
