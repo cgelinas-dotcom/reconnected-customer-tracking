@@ -34,13 +34,13 @@ DEFAULTS: dict[str, SettingSpec] = {
         unit="",
     ),
     "reid.auto_merge_threshold": SettingSpec(
-        default=0.85, min=0.75, max=0.99,
+        default=0.80, min=0.70, max=0.99,
         description="After a person's fingerprint is updated, if it's now this similar "
                     "to ANOTHER existing person in the same store, the two get auto-merged. "
-                    "0.85 catches the multi-shot averaged fingerprints of the same person "
-                    "(which usually score 0.85-0.92 pairwise). Crank up to 0.90+ if you see "
-                    "false merges of distinct customers; crank down to 0.80 if duplicates "
-                    "still aren't merging.",
+                    "0.80 catches same-person drift across the day (different angles, "
+                    "lighting); distinct customers usually score 0.3-0.6 pairwise so there's "
+                    "a lot of margin. Crank up to 0.85+ if you see false merges of two real "
+                    "customers; crank down to 0.75 if obvious duplicates still aren't merging.",
         unit="",
     ),
     "reid.recency_window_sec": SettingSpec(

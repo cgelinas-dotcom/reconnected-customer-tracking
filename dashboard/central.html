@@ -38,8 +38,11 @@
   <div style="margin-bottom:20px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <button onclick="pullAll()" id="pull-all-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #ccc;background:#0a66c2;color:white;cursor:pointer;font:inherit;font-weight:600">⬇️ Pull from GitHub + restart all stores</button>
     <button onclick="wipeAll()" id="wipe-all-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #b91c1c;background:#fff;color:#b91c1c;cursor:pointer;font:inherit;font-weight:600">⚠️ Wipe all data — start fresh on all stores</button>
+    <button onclick="scanMergeAll(false)" id="scan-merge-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #0a7d33;background:#fff;color:#0a7d33;cursor:pointer;font:inherit;font-weight:600">🔁 Scan + auto-merge duplicates (all stores)</button>
+    <button onclick="scanMergeAll(true)" id="scan-merge-preview-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #ccc;background:#fff;color:#444;cursor:pointer;font:inherit">Preview only</button>
     <span id="pull-status" style="font-size:13px;color:var(--muted)"></span>
     <span id="wipe-status" style="font-size:13px;color:var(--muted)"></span>
+    <span id="scan-merge-status" style="font-size:13px;color:var(--muted)"></span>
   </div>
   <pre id="pull-log" style="display:none;font-size:11px;background:#000;color:#0f0;padding:10px;border-radius:6px;max-height:300px;overflow:auto;white-space:pre-wrap;margin-bottom:20px"></pre>
 
@@ -243,6 +246,62 @@
         }
       } catch (e) {
         status.innerHTML = `<span style="color:var(--err)">Error: ${e.message}</span>`;
+      } finally {
+        btn.disabled = false; btn.style.opacity = 1;
+      }
+    }
+
+    async function scanMergeAll(dryRun) {
+      const verb = dryRun ? 'PREVIEW' : 'EXECUTE';
+      if (!dryRun) {
+        const ok = confirm(
+          "Scan + auto-merge duplicates on ALL 8 stores?\n\n" +
+          "This finds pairs of P numbers whose fingerprints are similar enough " +
+          "to be the same person (using the current reid.auto_merge_threshold) " +
+          "and collapses each group into its lowest-numbered P. Detection logs, " +
+          "entry events, and employee tags are all transferred to the kept P.\n\n" +
+          "Pipelines + dashboards auto-restart after so registries reload clean.\n\n" +
+          "Continue?"
+        );
+        if (!ok) return;
+      }
+      const btn = document.getElementById(dryRun ? 'scan-merge-preview-btn' : 'scan-merge-btn');
+      const status = document.getElementById('scan-merge-status');
+      const log = document.getElementById('pull-log');
+      btn.disabled = true; btn.style.opacity = 0.6;
+      status.textContent = `${verb}: scanning all 8 stores...`;
+      log.style.display = 'block'; log.textContent = '';
+      try {
+        const r = await fetch('/api/all_stores/scan_and_merge', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({dry_run: dryRun}),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+          status.textContent = `Error: ${d.error || r.status}`;
+          return;
+        }
+        if (dryRun) {
+          status.innerHTML = `<span style="color:var(--accent)">PREVIEW: ${d.fleet_total_groups_merged} duplicate groups across the fleet would collapse</span>`;
+        } else {
+          status.innerHTML = `<span style="color:var(--accent)">✓ ${d.fleet_total_groups_merged} groups collapsed across ${d.ok_count}/${d.total} stores; ${d.fleet_total_persons_deleted} P numbers deleted</span>`;
+        }
+        log.textContent = d.results.map(r => {
+          if (!r.ok) return `=== ${r.name} (${r.id}) — ✗ FAILED (${r.took_sec}s) ===\nerror: ${r.error || 'unknown'}\n`;
+          const dd = r.data || {};
+          let body = `scanned ${dd.scanned_persons || 0} persons, found ${dd.candidate_pairs || 0} candidate pairs, ${dd.groups_merged || dd.groups_to_merge || 0} groups\n`;
+          if (dd.groups_preview) {
+            body += dd.groups_preview.map(g => `  P${g.canonical} <- absorbs ${g.absorbed.map(x => 'P'+x).join(', ')}`).join('\n') + '\n';
+          }
+          if (!dryRun && dd.persons_deleted !== undefined) {
+            body += `deleted ${dd.persons_deleted} P numbers, updated ${dd.track_persons_updated} track_persons, ${dd.entry_events_updated} entry_events\n`;
+          }
+          if (dd.restart) body += `restart: ${dd.restart}\n`;
+          return `=== ${r.name} (${r.id}) — ✓ OK (${r.took_sec}s) ===\n${body}`;
+        }).join('\n');
+      } catch (e) {
+        status.textContent = `Error: ${e.message}`;
       } finally {
         btn.disabled = false; btn.style.opacity = 1;
       }

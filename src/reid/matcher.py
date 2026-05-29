@@ -25,12 +25,12 @@ import numpy as np
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.88  # tuned for OSNet; ResNet18 wants ~0.78
 DEFAULT_RECENCY_WINDOW_SEC = 2592000  # 30 days — enables cross-day returning-customer matching
-# Auto-merge is stricter than the match threshold but realistic for averaged
-# embeddings: two multi-shot averaged fingerprints of the same person typically
-# land around 0.85-0.92 cosine sim because of OSNet's noise floor. 0.85 is the
-# sweet spot — catches genuine duplicates, safely above any distinct-customer
-# pairwise similarity (which is usually 0.3-0.6 for different people).
-DEFAULT_AUTO_MERGE_THRESHOLD = 0.85
+# Auto-merge default: catches genuine same-person duplicates while staying
+# safely above what distinct customers score. Real OSNet drift over a day
+# (different angle, lighting, posture) puts same-person averaged embeddings
+# at ~0.70-0.85 sim to each other, so 0.85 was too strict in practice.
+# Distinct people at the same store still score 0.3-0.6 — plenty of margin.
+DEFAULT_AUTO_MERGE_THRESHOLD = 0.80
 
 # Confidence zones for the active-wait pattern. "borderline" cases let
 # the caller defer the decision and gather more samples first.

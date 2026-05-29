@@ -429,6 +429,197 @@ def merge_persons(payload: MergeRequest):
     }
 
 
+class ScanMergeRequest(BaseModel):
+    threshold: float | None = None  # None = use reid.auto_merge_threshold setting
+    dry_run: bool = False           # if True, report groups but don't actually merge
+
+
+@app.post("/api/persons/scan_and_merge_duplicates")
+def scan_and_merge_duplicates(payload: ScanMergeRequest):
+    """Scan the entire persons table for same-store pairs above the
+    auto_merge_threshold, build connected merge groups via Union-Find, and
+    fold each group into its lowest-numbered P. Cleans up all accumulated
+    fragmentation in one shot.
+
+    Uses the same merge mechanics as /api/persons/merge but applied across
+    every detected group, then triggers a single pipeline+dashboard restart
+    at the end so in-memory registries reload the cleaned state.
+
+    Set dry_run=true to preview groups without actually merging."""
+    import sys
+    import numpy as np
+    if not DB_PATH.exists():
+        raise HTTPException(404, "DB doesn't exist yet")
+
+    from src import settings as settings_mod
+    with db() as conn:
+        threshold = (
+            payload.threshold
+            if payload.threshold is not None
+            else float(settings_mod.get(conn, "reid.auto_merge_threshold"))
+        )
+
+        # Load all persons with their embeddings
+        rows = conn.execute(
+            "SELECT person_id, embedding, first_store, embedding_model FROM persons"
+        ).fetchall()
+        if not rows:
+            return {
+                "ok": True,
+                "scanned_persons": 0,
+                "groups_merged": 0,
+                "persons_deleted": 0,
+                "threshold": threshold,
+                "dry_run": payload.dry_run,
+                "message": "No persons in DB.",
+            }
+
+        persons = []
+        for r in rows:
+            pid, emb_blob, store, model = r
+            try:
+                emb = np.frombuffer(emb_blob, dtype=np.float32)
+            except Exception:
+                continue
+            persons.append({"pid": pid, "emb": emb, "store": store, "model": model})
+
+        # Union-Find for building merge groups
+        parent = {p["pid"]: p["pid"] for p in persons}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            # Keep lower pid as root
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        # Pairwise scan, same-store only, same-model only
+        candidate_pairs = []
+        n = len(persons)
+        for i in range(n):
+            for j in range(i + 1, n):
+                p1, p2 = persons[i], persons[j]
+                if p1["store"] != p2["store"]:
+                    continue
+                if p1["model"] != p2["model"]:
+                    continue
+                if p1["emb"].shape != p2["emb"].shape:
+                    continue
+                # cosine sim: embeddings are unit-normalized
+                sim = float(np.dot(p1["emb"], p2["emb"]))
+                if sim >= threshold:
+                    candidate_pairs.append((p1["pid"], p2["pid"], sim))
+                    union(p1["pid"], p2["pid"])
+
+        # Build groups: {root: set(members)}
+        groups: dict = {}
+        for p in persons:
+            root = find(p["pid"])
+            groups.setdefault(root, set()).add(p["pid"])
+        # Filter to only groups with 2+ members (actual merges)
+        merge_groups = [
+            (root, sorted(members))
+            for root, members in groups.items()
+            if len(members) > 1
+        ]
+
+        if payload.dry_run:
+            return {
+                "ok": True,
+                "scanned_persons": len(persons),
+                "candidate_pairs": len(candidate_pairs),
+                "groups_to_merge": len(merge_groups),
+                "groups_preview": [
+                    {"canonical": root, "absorbed": [m for m in members if m != root]}
+                    for root, members in merge_groups[:50]
+                ],
+                "threshold": threshold,
+                "dry_run": True,
+            }
+
+        # Actually merge: for each group, apply the same DB updates as /api/persons/merge
+        ensure_employees_table()
+        total_persons_deleted = 0
+        total_track_persons_updated = 0
+        total_entry_events_updated = 0
+        for canonical, members in merge_groups:
+            absorbed_ids = [m for m in members if m != canonical]
+            if not absorbed_ids:
+                continue
+            placeholders = ",".join("?" * len(absorbed_ids))
+            n_tp = conn.execute(
+                f"UPDATE track_persons SET person_id = ? WHERE person_id IN ({placeholders})",
+                [canonical, *absorbed_ids],
+            ).rowcount
+            n_ee = conn.execute(
+                f"UPDATE entry_events SET person_id = ? WHERE person_id IN ({placeholders})",
+                [canonical, *absorbed_ids],
+            ).rowcount
+            # Transfer employee tag if canonical doesn't have one but an absorbed does
+            existing_tag = conn.execute(
+                "SELECT 1 FROM employees WHERE person_id = ?", (canonical,)
+            ).fetchone()
+            if not existing_tag:
+                tag_row = conn.execute(
+                    f"SELECT name, role FROM employees WHERE person_id IN ({placeholders}) "
+                    "ORDER BY person_id LIMIT 1",
+                    absorbed_ids,
+                ).fetchone()
+                if tag_row:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO employees (person_id, name, role, tagged_via) "
+                        "VALUES (?, ?, ?, ?)",
+                        (canonical, tag_row[0], tag_row[1], "scan_merge"),
+                    )
+            conn.execute(
+                f"DELETE FROM employees WHERE person_id IN ({placeholders})",
+                absorbed_ids,
+            )
+            # Sum samples into canonical
+            absorbed_samples = conn.execute(
+                f"SELECT COALESCE(SUM(n_samples), 0) FROM persons WHERE person_id IN ({placeholders})",
+                absorbed_ids,
+            ).fetchone()[0]
+            if absorbed_samples:
+                conn.execute(
+                    "UPDATE persons SET n_samples = n_samples + ? WHERE person_id = ?",
+                    (absorbed_samples, canonical),
+                )
+            n_p = conn.execute(
+                f"DELETE FROM persons WHERE person_id IN ({placeholders})",
+                absorbed_ids,
+            ).rowcount
+            total_persons_deleted += n_p
+            total_track_persons_updated += n_tp
+            total_entry_events_updated += n_ee
+        conn.commit()
+
+    # One restart at the end so the pipeline reloads the cleaned gallery
+    restart_msg = _schedule_oneshot_restart(reason="scan_and_merge")
+
+    return {
+        "ok": True,
+        "scanned_persons": len(persons),
+        "candidate_pairs": len(candidate_pairs),
+        "groups_merged": len(merge_groups),
+        "persons_deleted": total_persons_deleted,
+        "track_persons_updated": total_track_persons_updated,
+        "entry_events_updated": total_entry_events_updated,
+        "threshold": threshold,
+        "dry_run": False,
+        "restart": restart_msg,
+    }
+
+
 class SettingUpdate(BaseModel):
     value: float
 

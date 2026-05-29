@@ -321,6 +321,75 @@ async def wipe_all_stores():
     return {"results": results, "ok_count": n_ok, "total": len(results)}
 
 
+class ScanMergeFanout(BaseModel):
+    threshold: float | None = None
+    dry_run: bool = False
+
+
+@app.post("/api/all_stores/scan_and_merge")
+async def scan_and_merge_all_stores(payload: ScanMergeFanout):
+    """Fan out the scan-and-merge cleanup to every store in parallel.
+    Each store scans its own persons table, finds pairs above the merge
+    threshold, and collapses fragmented IDs into their lowest-numbered P."""
+    stores = load_stores()
+    if not stores:
+        return {"results": [], "error": "No stores configured"}
+
+    body = {"threshold": payload.threshold, "dry_run": payload.dry_run}
+
+    async def scan_one(client: httpx.AsyncClient, store: dict) -> dict:
+        base = store["url"].rstrip("/")
+        started = time.time()
+        try:
+            r = await client.post(
+                f"{base}/api/persons/scan_and_merge_duplicates",
+                json=body,
+                timeout=60,
+            )
+            ok = r.status_code == 200
+            data = {}
+            err = None
+            try:
+                data = r.json()
+            except Exception:
+                pass
+            if not ok:
+                if r.status_code == 404:
+                    err = "HTTP 404 — store dashboard doesn't have scan_and_merge yet. Pull latest code first."
+                else:
+                    detail = data.get("detail") if isinstance(data, dict) else None
+                    err = f"HTTP {r.status_code}" + (f": {detail}" if detail else f": {r.text[:120]}")
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": ok,
+                "data": data if ok else {},
+                "error": err,
+                "took_sec": round(time.time() - started, 2),
+            }
+        except Exception as e:
+            return {
+                "id": store.get("id"),
+                "name": store.get("name"),
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:120]}",
+                "took_sec": round(time.time() - started, 2),
+            }
+
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[scan_one(client, s) for s in stores])
+    n_ok = sum(1 for r in results if r.get("ok"))
+    total_merged = sum(r.get("data", {}).get("groups_merged", 0) for r in results)
+    total_deleted = sum(r.get("data", {}).get("persons_deleted", 0) for r in results)
+    return {
+        "results": results,
+        "ok_count": n_ok,
+        "total": len(results),
+        "fleet_total_groups_merged": total_merged,
+        "fleet_total_persons_deleted": total_deleted,
+    }
+
+
 @app.post("/api/all_stores/restart_pipelines")
 async def restart_pipelines_all_stores():
     """Hit /api/admin/restart_pipeline on every store in parallel. Needed
