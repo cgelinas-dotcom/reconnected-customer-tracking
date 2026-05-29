@@ -296,6 +296,12 @@ def main() -> int:
     detections = 0
     start = time.time()
     last_live_write_ts = 0.0  # for the live-view JPEG throttle
+    # Per-track frame counter for periodic re-embedding. Embedding once at
+    # first sighting (a single shaky frame) is the main cause of re-ID
+    # fragmentation; refreshing every N frames builds a stable averaged
+    # fingerprint per person.
+    track_frames: dict[int, int] = {}
+    REID_REEMBED_EVERY = 30  # ~3 sec at 10fps processed
 
     try:
         while True:
@@ -341,22 +347,42 @@ def main() -> int:
                                  float(x1), float(y1), float(x2), float(y2), float(conf)))
 
                     pid_label = ""
-                    if reid_enabled and tid not in track_to_person:
-                        x1i, y1i = max(0, int(x1)), max(0, int(y1))
-                        x2i, y2i = min(w, int(x2)), min(h, int(y2))
-                        crop = frame[y1i:y2i, x1i:x2i]
-                        emb = embed_crop(crop)
-                        pid, sim = registry.assign(emb, ts, store_id, camera_id)
-                        track_to_person[tid] = pid
-                        db.execute(
-                            "INSERT OR REPLACE INTO track_persons "
-                            "(store_id, camera_id, track_id, person_id, match_sim, assigned_ts) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (store_id, camera_id, tid, pid, sim, ts),
+                    if reid_enabled:
+                        # Embed on first sighting of a track AND periodically
+                        # afterward. Each subsequent embedding gets averaged
+                        # into the stored person's fingerprint via
+                        # Person.update(), so the saved representation
+                        # stabilizes across many views instead of being
+                        # one shaky entering-frame snapshot.
+                        track_frames[tid] = track_frames.get(tid, 0) + 1
+                        is_first_sighting = tid not in track_to_person
+                        is_periodic_refresh = (
+                            not is_first_sighting
+                            and track_frames[tid] % REID_REEMBED_EVERY == 0
                         )
-                        persist_person(db, registry.persons[pid])
-                        match_note = f"matched sim={sim:.2f}" if sim is not None else "new"
-                        print(f"  [reid] track {tid} -> person {pid} ({match_note})")
+                        if is_first_sighting or is_periodic_refresh:
+                            x1i, y1i = max(0, int(x1)), max(0, int(y1))
+                            x2i, y2i = min(w, int(x2)), min(h, int(y2))
+                            crop = frame[y1i:y2i, x1i:x2i]
+                            if crop.size > 0:
+                                emb = embed_crop(crop)
+                                if is_first_sighting:
+                                    pid, sim = registry.assign(emb, ts, store_id, camera_id)
+                                    track_to_person[tid] = pid
+                                    db.execute(
+                                        "INSERT OR REPLACE INTO track_persons "
+                                        "(store_id, camera_id, track_id, person_id, match_sim, assigned_ts) "
+                                        "VALUES (?, ?, ?, ?, ?, ?)",
+                                        (store_id, camera_id, tid, pid, sim, ts),
+                                    )
+                                    persist_person(db, registry.persons[pid])
+                                    match_note = f"matched sim={sim:.2f}" if sim is not None else "new"
+                                    print(f"  [reid] track {tid} -> person {pid} ({match_note})")
+                                else:
+                                    pid = track_to_person[tid]
+                                    if pid in registry.persons:
+                                        registry.persons[pid].update(emb, ts)
+                                        persist_person(db, registry.persons[pid])
                     if reid_enabled:
                         pid = track_to_person.get(tid)
                         if pid is not None:
