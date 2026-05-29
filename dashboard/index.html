@@ -45,6 +45,8 @@
         <button onclick="adminRefreshSnapshots()">Refresh snapshots</button>
         <button onclick="adminRestartPipeline()">Restart pipeline + dashboard</button>
         <button onclick="adminGitPull()" class="danger">Pull from GitHub + restart</button>
+        <button onclick="adminWipeData()" style="background:#fff;color:#b91c1c;border:1px solid #b91c1c;padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit">⚠️ Wipe this store's data</button>
+        <button onclick="adminScanMerge()" style="background:#fff;color:#0a7d33;border:1px solid #0a7d33;padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit">🔁 Scan + merge duplicates here</button>
       </div>
       <div id="admin-snapshots" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px"></div>
 
@@ -515,6 +517,73 @@
       const r = await fetch('/api/admin/git_pull', {method: 'POST'});
       const d = await r.json();
       adminLog((d.ok ? '✓ Pulled + restarted\n' : '✗ Pull failed\n') + (d.pull || '') + '\n' + (d.restart || ''));
+    }
+
+    async function adminWipeData() {
+      const c1 = confirm(
+        "DESTRUCTIVE — wipe THIS store only\n\n" +
+        "Will delete all of the following on this store:\n" +
+        "  - All person re-ID records\n" +
+        "  - All track→person mappings\n" +
+        "  - All detection logs\n" +
+        "  - All entry/exit events\n" +
+        "  - All visit sessions\n" +
+        "  - All manually-tagged employees\n\n" +
+        "Kept: tuned settings (similarity threshold etc).\n\n" +
+        "Pipeline + dashboard will restart after the wipe.\n\n" +
+        "Continue?"
+      );
+      if (!c1) return;
+      const c2 = prompt('Type the word WIPE to confirm:');
+      if (c2 !== 'WIPE') { alert('Cancelled.'); return; }
+      adminLog('Scheduling wipe + restart...');
+      try {
+        const r = await fetch('/api/admin/wipe_data', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({confirm: 'yes'}),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+          adminLog(`✗ Wipe failed (HTTP ${r.status}): ${d.detail || JSON.stringify(d)}`);
+          return;
+        }
+        const counts = d.scheduled || d.deleted || {};
+        const lines = Object.entries(counts).map(([t, n]) => `  ${t}: ${n}`).join('\n');
+        adminLog(`✓ ${d.message || 'Wipe scheduled'}\n--- about to delete ---\n${lines}`);
+      } catch (e) {
+        adminLog(`✗ Wipe request crashed: ${e.message}`);
+      }
+    }
+
+    async function adminScanMerge() {
+      if (!confirm(
+        "Scan this store's persons table and merge duplicate P numbers?\n\n" +
+        "Finds pairs whose fingerprints are similar enough to be the same person " +
+        "(using reid.auto_merge_threshold, default 0.80) and collapses each group " +
+        "into its lowest-numbered P. Pipeline restarts after.\n\nContinue?"
+      )) return;
+      adminLog('Scanning + merging duplicates...');
+      try {
+        const r = await fetch('/api/persons/scan_and_merge_duplicates', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({dry_run: false}),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+          adminLog(`✗ Scan+merge failed (HTTP ${r.status}): ${d.detail || JSON.stringify(d)}`);
+          return;
+        }
+        adminLog(
+          `✓ scanned ${d.scanned_persons} persons; ${d.candidate_pairs} pairs above ${d.threshold} threshold\n` +
+          `   ${d.groups_merged || 0} groups collapsed; ${d.persons_deleted || 0} P numbers deleted\n` +
+          `   updated ${d.track_persons_updated || 0} track_persons, ${d.entry_events_updated || 0} entry_events\n` +
+          `restart: ${d.restart || ''}`
+        );
+      } catch (e) {
+        adminLog(`✗ Scan+merge request crashed: ${e.message}`);
+      }
     }
 
     function adminLog(text) {
