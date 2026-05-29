@@ -949,78 +949,36 @@ def admin_wipe_data(payload: WipeRequest):
                 deleted[tbl] = cur.rowcount
             except Exception as e:
                 deleted[tbl] = f"error: {type(e).__name__}: {e}"
-        try:
-            conn.execute("VACUUM")
-        except Exception:
-            pass
         conn.commit()
+    # VACUUM has to run OUTSIDE any transaction. The `with db() as conn` above
+    # finalized its transaction on .commit(). Open a fresh connection just for
+    # VACUUM so it can't error on "cannot VACUUM from within a transaction".
+    try:
+        import sqlite3 as _sqlite3
+        vac = _sqlite3.connect(str(DB_PATH))
+        vac.execute("VACUUM")
+        vac.close()
+    except Exception:
+        pass
 
-    # Trigger a detached restart so pipeline + dashboard reload with empty registries
-    restart_msg = "Wipe complete (no restart — not on Windows)"
-    if sys.platform == "win32":
-        ps_script = (
-            "Start-Sleep -Seconds 2; "
-            "Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; "
-            "Start-Sleep -Seconds 2; "
-            "schtasks /Run /TN CustomerTracking_Pipeline | Out-Null; "
-            "schtasks /Run /TN CustomerTracking_Dashboard | Out-Null"
-        )
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        try:
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
-            restart_msg = "Pipeline + dashboard restart scheduled in 2s — back online in ~5s with empty registry"
-        except Exception as e:
-            restart_msg = f"Restart spawn failed: {type(e).__name__}: {e}"
+    restart_msg = _schedule_oneshot_restart(reason="wipe_data")
     return {"ok": True, "deleted": deleted, "restart": restart_msg}
 
 
 @app.post("/api/admin/restart_pipeline")
 def admin_restart_pipeline():
-    """Restart BOTH the pipeline AND the dashboard processes. Same detached
-    PowerShell pattern as admin_git_pull — sleeps 2s so this HTTP response
-    ships first, then kills every python.exe (including this dashboard)
-    and re-runs both scheduled tasks. New dashboard returns in ~5s.
+    """Restart BOTH the pipeline AND the dashboard processes via a transient
+    Windows scheduled task that runs in its own session (immune to the
+    job-object cascade that broke the earlier detached-PowerShell approach).
 
     Restarting the dashboard is necessary whenever src/api/*.py code has
     changed on disk — Python loads modules at startup, so a stale dashboard
     process keeps serving old endpoints even after a git pull."""
     import sys
-    import subprocess
     if sys.platform != "win32":
         return {"ok": False, "skipped": True, "reason": "not running on Windows"}
-
-    ps_script = (
-        "Start-Sleep -Seconds 2; "
-        "Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; "
-        "Start-Sleep -Seconds 2; "
-        "schtasks /Run /TN CustomerTracking_Pipeline | Out-Null; "
-        "schtasks /Run /TN CustomerTracking_Dashboard | Out-Null"
-    )
-    DETACHED_PROCESS = 0x00000008
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
-    try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-        )
-        return {
-            "ok": True,
-            "log": "Pipeline + dashboard restart scheduled in 2s — both will be back online in ~5s.",
-        }
-    except Exception as e:
-        return {"ok": False, "log": f"Failed to spawn detached restart: {type(e).__name__}: {e}"}
+    msg = _schedule_oneshot_restart(reason="manual_restart")
+    return {"ok": True, "log": msg}
 
 
 @app.get("/api/admin/health")
@@ -1096,6 +1054,71 @@ def admin_health():
         except Exception:
             pass
     return out
+
+
+def _schedule_oneshot_restart(reason: str = "ops") -> str:
+    """Reliable Windows restart pattern: register a transient scheduled task
+    to fire ~2 seconds from now as SYSTEM in its own session. The task body
+    kills python (us included), waits, restarts both pipeline + dashboard
+    scheduled tasks, then self-deletes.
+
+    Why this works when detached-PowerShell didn't: Windows scheduled tasks
+    run in their own session, fully isolated from the caller's process tree
+    and job object. Even if THIS dashboard process is killed before this
+    function returns, the task is already registered with the Windows
+    scheduler and will fire on time.
+
+    Returns a human-readable status message."""
+    import sys
+    import subprocess
+    if sys.platform != "win32":
+        return f"restart skipped ({reason}; not on Windows)"
+
+    # Unique task name so concurrent restart requests don't clobber each other
+    import uuid
+    task_name = f"CT_OneShotRestart_{uuid.uuid4().hex[:8]}"
+
+    # The body of the scheduled task. Single line PowerShell.
+    body = (
+        "Get-Process python -ErrorAction SilentlyContinue | "
+        "Stop-Process -Force -ErrorAction SilentlyContinue; "
+        "Start-Sleep -Seconds 3; "
+        "Start-ScheduledTask -TaskName 'CustomerTracking_Pipeline'; "
+        "Start-ScheduledTask -TaskName 'CustomerTracking_Dashboard'; "
+        f"schtasks /Delete /TN '{task_name}' /F"
+    )
+
+    # Register the task via PowerShell. We can do this synchronously because
+    # registering a future-trigger task takes <1s and returns immediately.
+    register_script = (
+        "$ErrorActionPreference='Stop'; "
+        "$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2); "
+        f"$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "
+        f"'-NoProfile -WindowStyle Hidden -Command \"{body}\"'; "
+        "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' "
+        "-LogonType ServiceAccount -RunLevel Highest; "
+        f"Register-ScheduledTask -TaskName '{task_name}' -Action $action "
+        "-Trigger $trigger -Principal $principal -Force | Out-Null"
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", register_script],
+            capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            return (
+                f"Failed to register restart task: "
+                f"{(result.stderr or result.stdout or '')[:200]}"
+            )
+        return (
+            f"Restart task '{task_name}' registered to fire in 2s "
+            f"({reason}). Both processes will be killed and restarted "
+            f"in their own session. Back online in ~5s."
+        )
+    except Exception as e:
+        return f"Restart-task registration crashed: {type(e).__name__}: {e}"
 
 
 def _find_git() -> str | None:
@@ -1228,31 +1251,5 @@ def admin_git_pull():
         except Exception:
             pass
 
-    restart_msg = "Restart skipped (not on Windows)"
-    if sys.platform == "win32":
-        # Detached PowerShell: kills the dashboard (and us) after the response
-        # ships, then restarts both scheduled tasks. Using port-based kill +
-        # explicit wait so the new dashboard doesn't race for port 8000.
-        ps_script = (
-            "Start-Sleep -Seconds 2; "
-            "Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; "
-            "Start-Sleep -Seconds 2; "
-            "schtasks /Run /TN CustomerTracking_Pipeline | Out-Null; "
-            "schtasks /Run /TN CustomerTracking_Dashboard | Out-Null"
-        )
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        try:
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
-            restart_msg = "Restart scheduled in 2s — dashboard will be back in ~5s"
-        except Exception as e:
-            restart_msg = f"Detached restart failed to spawn: {type(e).__name__}: {e}"
-
+    restart_msg = _schedule_oneshot_restart(reason="git_pull")
     return {"ok": True, "pull": pull_out, "restart": restart_msg}
