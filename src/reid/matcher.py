@@ -25,6 +25,12 @@ import numpy as np
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.88  # tuned for OSNet; ResNet18 wants ~0.78
 DEFAULT_RECENCY_WINDOW_SEC = 2592000  # 30 days — enables cross-day returning-customer matching
+# Auto-merge is stricter than the match threshold but realistic for averaged
+# embeddings: two multi-shot averaged fingerprints of the same person typically
+# land around 0.85-0.92 cosine sim because of OSNet's noise floor. 0.85 is the
+# sweet spot — catches genuine duplicates, safely above any distinct-customer
+# pairwise similarity (which is usually 0.3-0.6 for different people).
+DEFAULT_AUTO_MERGE_THRESHOLD = 0.85
 
 # Confidence zones for the active-wait pattern. "borderline" cases let
 # the caller defer the decision and gather more samples first.
@@ -179,6 +185,76 @@ class PersonRegistry:
         """Commit a confident match by updating the existing person's fingerprint."""
         if pid in self.persons:
             self.persons[pid].update(emb, ts, color_sig)
+
+    def find_auto_merge_candidate(self, just_updated_pid: int, store_id: str,
+                                  auto_merge_threshold: float = DEFAULT_AUTO_MERGE_THRESHOLD
+                                  ) -> tuple[int, int, float] | None:
+        """After updating just_updated_pid, check whether its fingerprint has
+        become very similar (>= auto_merge_threshold) to any OTHER person in
+        the same-store gallery. If so, return (canonical_pid, absorbed_pid,
+        similarity) — the merge action the caller should perform.
+
+        canonical = the lower person_id (keep). absorbed = the higher (delete).
+        We only consider same-store candidates because cross-store merges are
+        riskier and Cam's stores are far apart geographically.
+
+        Returns None if no candidate clears the threshold."""
+        if just_updated_pid not in self.persons:
+            return None
+        target = self.persons[just_updated_pid]
+        if not target.first_store or target.first_store != store_id:
+            # Defensive: only auto-merge within the just-updated person's store
+            store_id = target.first_store
+        best_other_pid = None
+        best_sim = auto_merge_threshold
+        for other_pid, other in self.persons.items():
+            if other_pid == just_updated_pid:
+                continue
+            if other.embedding_model != self.active_model:
+                continue
+            if other.embedding.shape != target.embedding.shape:
+                continue
+            if other.first_store != store_id:
+                continue  # same-store only
+            sim = float(np.dot(target.embedding, other.embedding))
+            if sim > best_sim:
+                best_sim = sim
+                best_other_pid = other_pid
+        if best_other_pid is None:
+            return None
+        canonical_pid = min(just_updated_pid, best_other_pid)
+        absorbed_pid = max(just_updated_pid, best_other_pid)
+        return canonical_pid, absorbed_pid, best_sim
+
+    def apply_auto_merge(self, canonical_pid: int, absorbed_pid: int) -> None:
+        """In-memory side of an auto-merge: weighted-average the embeddings
+        and color signatures, sum the sample counts, advance last_seen_ts,
+        then remove the absorbed entry. Caller must perform the matching
+        DB updates (track_persons, entry_events, persons, employees)."""
+        if canonical_pid not in self.persons or absorbed_pid not in self.persons:
+            return
+        canonical = self.persons[canonical_pid]
+        absorbed = self.persons[absorbed_pid]
+        total = max(1, canonical.n_samples + absorbed.n_samples)
+        new_emb = (
+            canonical.embedding * canonical.n_samples
+            + absorbed.embedding * absorbed.n_samples
+        ) / total
+        n = float(np.linalg.norm(new_emb))
+        canonical.embedding = new_emb / n if n > 0 else new_emb
+        # Color signature: also weighted-merge if both have one
+        if canonical.color_signature and absorbed.color_signature and \
+                len(canonical.color_signature) == len(absorbed.color_signature):
+            canonical.color_signature = [
+                (a * canonical.n_samples + b * absorbed.n_samples) / total
+                for a, b in zip(canonical.color_signature, absorbed.color_signature)
+            ]
+        elif not canonical.color_signature and absorbed.color_signature:
+            canonical.color_signature = list(absorbed.color_signature)
+        canonical.n_samples = total
+        canonical.last_seen_ts = max(canonical.last_seen_ts, absorbed.last_seen_ts)
+        canonical.first_seen_ts = min(canonical.first_seen_ts, absorbed.first_seen_ts)
+        del self.persons[absorbed_pid]
 
     def commit_new(self, emb: np.ndarray, ts: float, store_id: str, camera_id: str,
                    color_sig: list | None = None) -> int:

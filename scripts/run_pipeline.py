@@ -127,6 +127,59 @@ def average_embeddings(embs: list):
     return (avg / n) if n > 0 else avg
 
 
+def maybe_auto_merge(registry, just_updated_pid: int, store_id: str,
+                     auto_merge_threshold: float,
+                     track_to_person: dict, db) -> int | None:
+    """After updating just_updated_pid, check whether it's now too similar
+    to another existing person in the gallery. If yes, merge them: update
+    DB foreign-key references to point at the canonical person, delete the
+    absorbed person from DB, and rewire pipeline's in-memory track_to_person
+    so any future detections of the absorbed pid route to the canonical.
+
+    Returns the absorbed pid if a merge happened, else None."""
+    cand = registry.find_auto_merge_candidate(
+        just_updated_pid, store_id, auto_merge_threshold
+    )
+    if cand is None:
+        return None
+    canonical_pid, absorbed_pid, sim = cand
+    # In-memory: weighted-average embeddings, remove absorbed from registry
+    registry.apply_auto_merge(canonical_pid, absorbed_pid)
+    # DB: reassign every foreign-key reference to canonical, then delete absorbed
+    try:
+        db.execute(
+            "UPDATE track_persons SET person_id = ? WHERE person_id = ?",
+            (canonical_pid, absorbed_pid),
+        )
+        db.execute(
+            "UPDATE entry_events SET person_id = ? WHERE person_id = ?",
+            (canonical_pid, absorbed_pid),
+        )
+        # Preserve any employee tag from absorbed if canonical doesn't have one
+        absorbed_tag = db.execute(
+            "SELECT name, role FROM employees WHERE person_id = ?", (absorbed_pid,)
+        ).fetchone()
+        canonical_tag = db.execute(
+            "SELECT 1 FROM employees WHERE person_id = ?", (canonical_pid,)
+        ).fetchone()
+        if absorbed_tag and not canonical_tag:
+            db.execute(
+                "INSERT OR REPLACE INTO employees (person_id, name, role, tagged_via) "
+                "VALUES (?, ?, ?, ?)",
+                (canonical_pid, absorbed_tag[0], absorbed_tag[1], "auto_merge"),
+            )
+        db.execute("DELETE FROM employees WHERE person_id = ?", (absorbed_pid,))
+        db.execute("DELETE FROM persons WHERE person_id = ?", (absorbed_pid,))
+    except Exception as e:
+        print(f"  [auto-merge] DB cleanup error: {type(e).__name__}: {e}")
+    # Pipeline memory: any tracks still mapped to absorbed_pid get rerouted
+    for tid, mapped_pid in list(track_to_person.items()):
+        if mapped_pid == absorbed_pid:
+            track_to_person[tid] = canonical_pid
+    print(f"  [auto-merge] P{absorbed_pid} -> P{canonical_pid} (sim={sim:.3f})")
+    return absorbed_pid
+
+
 def parse_source(arg: str):
     if arg.isdigit():
         return int(arg), "webcam"
@@ -337,9 +390,11 @@ def main() -> int:
         from src.reid.embeddings import embed_crop, MODEL_NAME as REID_MODEL_NAME
         reid_threshold = settings_mod.get(db, "reid.similarity_threshold")
         reid_window = settings_mod.get(db, "reid.recency_window_sec")
+        reid_auto_merge_threshold = settings_mod.get(db, "reid.auto_merge_threshold")
         print(f"Re-ID model: {REID_MODEL_NAME}")
         print(f"Re-ID similarity threshold: {reid_threshold}")
         print(f"Re-ID recency window: {int(reid_window)}s ({reid_window/3600:.1f}h)")
+        print(f"Re-ID auto-merge threshold: {reid_auto_merge_threshold}")
         registry = load_registry_from_db(db, active_model=REID_MODEL_NAME)
         registry.similarity_threshold = reid_threshold
         registry.recency_window_sec = reid_window
@@ -505,6 +560,16 @@ def main() -> int:
                                                       f"({match_note}, {n_have}-shot{forced})")
                                                 track_warmup_embeds.pop(tid, None)
                                                 track_warmup_colors.pop(tid, None)
+                                                # Auto-merge check: did this update cause
+                                                # P{pid} to become near-identical to another
+                                                # gallery person at the same store?
+                                                absorbed = maybe_auto_merge(
+                                                    registry, pid, store_id,
+                                                    reid_auto_merge_threshold,
+                                                    track_to_person, db,
+                                                )
+                                                if absorbed is not None:
+                                                    pid = track_to_person.get(tid, pid)
                                             # else: borderline, keep waiting
                                     else:
                                         # Periodic refresh of an existing assignment
@@ -512,6 +577,15 @@ def main() -> int:
                                         if pid in registry.persons:
                                             registry.persons[pid].update(emb, ts, csig)
                                             persist_person(db, registry.persons[pid])
+                                            # Auto-merge after refresh too — re-embedding
+                                            # may have shifted P{pid} into a doppelganger's zone
+                                            absorbed = maybe_auto_merge(
+                                                registry, pid, store_id,
+                                                reid_auto_merge_threshold,
+                                                track_to_person, db,
+                                            )
+                                            if absorbed is not None:
+                                                pid = track_to_person.get(tid, pid)
                     if reid_enabled:
                         pid = track_to_person.get(tid)
                         if pid is not None:

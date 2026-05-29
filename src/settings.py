@@ -33,6 +33,16 @@ DEFAULTS: dict[str, SettingSpec] = {
                     "store against gut-feel counts.",
         unit="",
     ),
+    "reid.auto_merge_threshold": SettingSpec(
+        default=0.85, min=0.75, max=0.99,
+        description="After a person's fingerprint is updated, if it's now this similar "
+                    "to ANOTHER existing person in the same store, the two get auto-merged. "
+                    "0.85 catches the multi-shot averaged fingerprints of the same person "
+                    "(which usually score 0.85-0.92 pairwise). Crank up to 0.90+ if you see "
+                    "false merges of distinct customers; crank down to 0.80 if duplicates "
+                    "still aren't merging.",
+        unit="",
+    ),
     "reid.recency_window_sec": SettingSpec(
         default=2592000, min=300, max=2592000,  # 5 min .. 30 days, default 30 days
         description="How far back to look when matching a new track to existing persons. "
