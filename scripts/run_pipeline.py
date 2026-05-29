@@ -127,6 +127,73 @@ def average_embeddings(embs: list):
     return (avg / n) if n > 0 else avg
 
 
+def scan_gallery_and_merge(registry, store_id: str, auto_merge_threshold: float,
+                            track_to_person: dict, db) -> list:
+    """Periodic full-gallery scan: find every same-store pair above
+    auto_merge_threshold and merge them in-place. Repeats until no more
+    pairs exist (handles transitive groups: A~B~C all collapse to lowest).
+
+    Runs in the pipeline process so the in-memory registry stays consistent
+    — no restart needed. Returns list of (canonical_pid, absorbed_pid, sim).
+
+    This is the automatic self-healing equivalent of the manual
+    /api/persons/scan_and_merge_duplicates endpoint, but cheaper because
+    it doesn't have to schedule a process restart at the end."""
+    merges = []
+    iterations = 0
+    max_iterations = max(10, len(registry.persons))  # safety bound
+    while iterations < max_iterations:
+        iterations += 1
+        candidate = None
+        for pid in list(registry.persons.keys()):
+            cand = registry.find_auto_merge_candidate(
+                pid, store_id, auto_merge_threshold
+            )
+            if cand is not None:
+                candidate = cand
+                break
+        if candidate is None:
+            break
+        canonical_pid, absorbed_pid, sim = candidate
+        # In-memory
+        registry.apply_auto_merge(canonical_pid, absorbed_pid)
+        # DB cleanup (same logic as maybe_auto_merge below)
+        try:
+            db.execute(
+                "UPDATE track_persons SET person_id = ? WHERE person_id = ?",
+                (canonical_pid, absorbed_pid),
+            )
+            db.execute(
+                "UPDATE entry_events SET person_id = ? WHERE person_id = ?",
+                (canonical_pid, absorbed_pid),
+            )
+            absorbed_tag = db.execute(
+                "SELECT name, role FROM employees WHERE person_id = ?",
+                (absorbed_pid,),
+            ).fetchone()
+            canonical_tag = db.execute(
+                "SELECT 1 FROM employees WHERE person_id = ?",
+                (canonical_pid,),
+            ).fetchone()
+            if absorbed_tag and not canonical_tag:
+                db.execute(
+                    "INSERT OR REPLACE INTO employees (person_id, name, role, tagged_via) "
+                    "VALUES (?, ?, ?, ?)",
+                    (canonical_pid, absorbed_tag[0], absorbed_tag[1], "auto_scan"),
+                )
+            db.execute("DELETE FROM employees WHERE person_id = ?", (absorbed_pid,))
+            db.execute("DELETE FROM persons WHERE person_id = ?", (absorbed_pid,))
+        except Exception as e:
+            print(f"  [auto-scan] DB error during merge P{absorbed_pid}->P{canonical_pid}: "
+                  f"{type(e).__name__}: {e}")
+        # Track rewiring
+        for tid, mapped_pid in list(track_to_person.items()):
+            if mapped_pid == absorbed_pid:
+                track_to_person[tid] = canonical_pid
+        merges.append((canonical_pid, absorbed_pid, sim))
+    return merges
+
+
 def maybe_auto_merge(registry, just_updated_pid: int, store_id: str,
                      auto_merge_threshold: float,
                      track_to_person: dict, db) -> int | None:
@@ -391,10 +458,12 @@ def main() -> int:
         reid_threshold = settings_mod.get(db, "reid.similarity_threshold")
         reid_window = settings_mod.get(db, "reid.recency_window_sec")
         reid_auto_merge_threshold = settings_mod.get(db, "reid.auto_merge_threshold")
+        reid_auto_scan_interval = settings_mod.get(db, "reid.auto_scan_interval_sec")
         print(f"Re-ID model: {REID_MODEL_NAME}")
         print(f"Re-ID similarity threshold: {reid_threshold}")
         print(f"Re-ID recency window: {int(reid_window)}s ({reid_window/3600:.1f}h)")
         print(f"Re-ID auto-merge threshold: {reid_auto_merge_threshold}")
+        print(f"Re-ID auto-scan interval: {int(reid_auto_scan_interval)}s")
         registry = load_registry_from_db(db, active_model=REID_MODEL_NAME)
         registry.similarity_threshold = reid_threshold
         registry.recency_window_sec = reid_window
@@ -415,6 +484,7 @@ def main() -> int:
     detections = 0
     start = time.time()
     last_live_write_ts = 0.0  # for the live-view JPEG throttle
+    last_auto_scan_ts = 0.0   # for the periodic gallery scan
 
     # ----- Phase 2.1 re-ID state -----
     # Per-track frame counter for periodic re-embedding.
@@ -676,6 +746,28 @@ def main() -> int:
                     last_live_write_ts = now_ts
                 except Exception as _e:
                     pass  # don't crash the pipeline if disk write hiccups
+
+            # Periodic gallery scan: continuously find pairs of P numbers that
+            # should be merged (drift across the day, fragmentation from
+            # borderline matches that committed as "new") and collapse them.
+            # No restart needed — we update the in-memory registry directly.
+            if reid_enabled and registry is not None:
+                if now_ts - last_auto_scan_ts > reid_auto_scan_interval:
+                    last_auto_scan_ts = now_ts
+                    if len(registry.persons) >= 2:
+                        merges = scan_gallery_and_merge(
+                            registry, store_id, reid_auto_merge_threshold,
+                            track_to_person, db,
+                        )
+                        if merges:
+                            db.commit()
+                            n = len(merges)
+                            preview = ", ".join(
+                                f"P{a}->P{c}({s:.2f})" for c, a, s in merges[:5]
+                            )
+                            tail = f" (+{n-5} more)" if n > 5 else ""
+                            print(f"  [auto-scan] T+{int(now_ts - start)}s: "
+                                  f"merged {n} pair(s): {preview}{tail}")
 
             if show_preview:
                 cv2.imshow("pipeline", frame)

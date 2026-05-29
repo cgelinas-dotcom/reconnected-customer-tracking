@@ -33,6 +33,15 @@ DEFAULTS: dict[str, SettingSpec] = {
                     "store against gut-feel counts.",
         unit="",
     ),
+    "reid.auto_scan_interval_sec": SettingSpec(
+        default=30, min=5, max=3600,
+        description="How often the pipeline scans the entire gallery for pairs of P "
+                    "numbers similar enough to be the same person, and auto-merges them. "
+                    "Default 30s keeps the gallery clean continuously without much CPU "
+                    "cost (scan is O(n²) on a small gallery). Drop to 10s if duplicates "
+                    "are bothering you; raise to 300s to reduce CPU.",
+        unit="seconds",
+    ),
     "reid.auto_merge_threshold": SettingSpec(
         default=0.80, min=0.70, max=0.99,
         description="After a person's fingerprint is updated, if it's now this similar "
