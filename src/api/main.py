@@ -1027,14 +1027,19 @@ class WipeRequest(BaseModel):
 @app.post("/api/admin/wipe_data")
 def admin_wipe_data(payload: WipeRequest):
     """Destructive: clears all re-ID / detection / entry data so the store
-    starts fresh. Preserves the settings table (tuned threshold, recency
-    window, etc) and then triggers a detached pipeline + dashboard restart
-    so the in-memory PersonRegistry also resets.
+    starts fresh. Preserves the settings table.
 
-    Requires explicit {"confirm": "yes"} in the body to avoid accidental
-    curl. Returns per-table delete counts."""
+    Race-free design: we DO NOT delete the rows from this dashboard process.
+    Instead we schedule a one-shot Windows task that (a) kills python first
+    so the pipeline can't write any more rows, (b) does the DELETE with no
+    other process touching the DB, (c) restarts the scheduled tasks. This
+    eliminates the previous race where the still-running pipeline could
+    persist rows in the 2-second window between DELETE and restart.
+
+    Requires explicit {"confirm": "yes"} in the body. Returns CURRENT row
+    counts (what's about to be deleted) — the actual delete happens after
+    this response."""
     import sys
-    import subprocess
     if payload.confirm != "yes":
         raise HTTPException(400, 'Body must include {"confirm": "yes"}')
 
@@ -1046,28 +1051,98 @@ def admin_wipe_data(payload: WipeRequest):
         "employees",        # manual employee tags (reference person_ids being wiped)
         "persons",          # the re-ID person registry
     ]
-    deleted: dict = {}
+
+    # Capture current row counts (what's about to be deleted) so the response
+    # is informative. We don't actually delete here — that happens in the
+    # scheduled task AFTER python is killed.
+    current_counts: dict = {}
     with db() as conn:
         for tbl in tables_to_clear:
             try:
-                cur = conn.execute(f"DELETE FROM {tbl}")
-                deleted[tbl] = cur.rowcount
+                row = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()
+                current_counts[tbl] = row[0] if row else 0
             except Exception as e:
-                deleted[tbl] = f"error: {type(e).__name__}: {e}"
-        conn.commit()
-    # VACUUM has to run OUTSIDE any transaction. The `with db() as conn` above
-    # finalized its transaction on .commit(). Open a fresh connection just for
-    # VACUUM so it can't error on "cannot VACUUM from within a transaction".
-    try:
-        import sqlite3 as _sqlite3
-        vac = _sqlite3.connect(str(DB_PATH))
-        vac.execute("VACUUM")
-        vac.close()
-    except Exception:
-        pass
+                current_counts[tbl] = f"error: {type(e).__name__}: {e}"
 
-    restart_msg = _schedule_oneshot_restart(reason="wipe_data")
-    return {"ok": True, "deleted": deleted, "restart": restart_msg}
+    if sys.platform != "win32":
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "not Windows; race-free wipe requires Windows scheduled task",
+            "would_have_deleted": current_counts,
+        }
+
+    # Schedule a one-shot Windows task that does kill→wipe→restart atomically.
+    # Using the same isolation pattern as _schedule_oneshot_restart (transient
+    # scheduled task running as SYSTEM in its own session).
+    import subprocess
+    import uuid
+    task_name = f"CT_WipeAndRestart_{uuid.uuid4().hex[:8]}"
+    db_path_escaped = str(DB_PATH).replace("'", "''")  # single-quote escape for SQL
+
+    # The task body, written as a single PowerShell command string.
+    # Steps: kill python, wait, run python with embedded SQL DELETEs + VACUUM,
+    # restart both scheduled tasks, self-delete.
+    inline_python = (
+        "import sqlite3; "
+        f"db=sqlite3.connect(r'{db_path_escaped}'); "
+        "tabs=['entry_events','track_persons','visits','detections','employees','persons']; "
+        "[db.execute(f'DELETE FROM {{t}}') for t in tabs if True]; "  # ignore errors per-table at this layer
+        "db.commit(); db.close(); "
+        f"v=sqlite3.connect(r'{db_path_escaped}'); v.execute('VACUUM'); v.close()"
+    )
+    # Use the project's venv python for the embedded delete so it has sqlite3
+    venv_py = str(ROOT / ".venv" / "Scripts" / "python.exe")
+    body = (
+        "Get-Process python -ErrorAction SilentlyContinue | "
+        "Stop-Process -Force -ErrorAction SilentlyContinue; "
+        "Start-Sleep -Seconds 3; "
+        f"& '{venv_py}' -c \"\"\"{inline_python}\"\"\"; "
+        "Start-ScheduledTask -TaskName 'CustomerTracking_Pipeline'; "
+        "Start-ScheduledTask -TaskName 'CustomerTracking_Dashboard'; "
+        f"schtasks /Delete /TN '{task_name}' /F"
+    )
+
+    register_script = (
+        "$ErrorActionPreference='Stop'; "
+        "$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2); "
+        f"$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "
+        f"'-NoProfile -WindowStyle Hidden -Command \"{body}\"'; "
+        "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' "
+        "-LogonType ServiceAccount -RunLevel Highest; "
+        f"Register-ScheduledTask -TaskName '{task_name}' -Action $action "
+        "-Trigger $trigger -Principal $principal -Force | Out-Null"
+    )
+
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", register_script],
+            capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        if r.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"Failed to register wipe task: {(r.stderr or r.stdout or '')[:200]}",
+                "current_counts": current_counts,
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"Wipe-task registration crashed: {type(e).__name__}: {e}",
+            "current_counts": current_counts,
+        }
+
+    return {
+        "ok": True,
+        "scheduled": current_counts,
+        "task_name": task_name,
+        "message": (
+            f"Wipe task '{task_name}' registered to fire in 2s. "
+            "Will kill python first, THEN delete the rows (no race), then restart. "
+            "Back online in ~8s with empty registry."
+        ),
+    }
 
 
 @app.post("/api/admin/restart_pipeline")

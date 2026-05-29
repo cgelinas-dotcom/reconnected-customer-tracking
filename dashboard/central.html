@@ -283,7 +283,7 @@
           if (!r.ok) return `=== ${r.name} (${r.id}) — ✗ FAILED (${r.took_sec}s) ===\nerror: ${r.error || 'unknown'}\n`;
           const counts = Object.entries(r.deleted)
             .map(([t, n]) => `  ${t}: ${n}`).join('\n');
-          return `=== ${r.name} (${r.id}) — ✓ OK (${r.took_sec}s) ===\n--- deleted rows ---\n${counts}\n--- restart ---\n${r.restart || ''}\n`;
+          return `=== ${r.name} (${r.id}) — ✓ OK (${r.took_sec}s) ===\n--- scheduled to delete ---\n${counts}\n--- restart ---\n${r.restart || 'wipe task will run, kill python, delete rows, restart processes'}\n`;
         }).join('\n');
       } catch (e) {
         status.textContent = `Error: ${e.message}`;

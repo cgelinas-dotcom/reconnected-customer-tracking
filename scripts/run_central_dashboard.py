@@ -301,7 +301,7 @@ async def wipe_all_stores():
                 "id": store.get("id"),
                 "name": store.get("name"),
                 "ok": ok,
-                "deleted": body.get("deleted", {}) if ok else {},
+                "deleted": (body.get("scheduled") or body.get("deleted") or {}) if ok else {},
                 "restart": body.get("restart") if ok else None,
                 "error": err,
                 "took_sec": round(time.time() - started, 2),
