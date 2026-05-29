@@ -324,6 +324,111 @@ def unenroll_employee(person_id: int):
         return {"ok": True, "person_id": person_id}
 
 
+class MergeRequest(BaseModel):
+    canonical_person_id: int   # the P number to keep
+    merge_ids: list[int]       # the P numbers to fold into canonical
+
+
+@app.post("/api/persons/merge")
+def merge_persons(payload: MergeRequest):
+    """Manually merge duplicate P numbers into one canonical P. Updates every
+    foreign-key reference (track_persons, entry_events) to the canonical id,
+    transfers any employee tag from the merged set, then deletes the now-
+    redundant person rows. Triggers a pipeline+dashboard restart so the
+    in-memory registry reloads the cleaned state — otherwise the pipeline
+    might re-create the deleted persons via INSERT OR REPLACE.
+
+    Use case: OSNet created P671, P680, P685, P687 for the same person
+    (Gary). Cam picks them, calls this, the system collapses them into
+    just P671 with all of Gary's detections/events attributed correctly."""
+    if not payload.merge_ids:
+        raise HTTPException(400, "merge_ids cannot be empty")
+    if payload.canonical_person_id in payload.merge_ids:
+        raise HTTPException(400, "canonical_person_id cannot also be in merge_ids")
+    if not DB_PATH.exists():
+        raise HTTPException(404, "DB doesn't exist yet")
+
+    canonical = payload.canonical_person_id
+    placeholders = ",".join("?" * len(payload.merge_ids))
+
+    with db() as conn:
+        # Verify canonical exists
+        row = conn.execute(
+            "SELECT person_id FROM persons WHERE person_id = ?", (canonical,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Canonical person P{canonical} not found")
+
+        # Update foreign-key references
+        n_tp = conn.execute(
+            f"UPDATE track_persons SET person_id = ? WHERE person_id IN ({placeholders})",
+            [canonical, *payload.merge_ids],
+        ).rowcount
+        n_ee = conn.execute(
+            f"UPDATE entry_events SET person_id = ? WHERE person_id IN ({placeholders})",
+            [canonical, *payload.merge_ids],
+        ).rowcount
+
+        # Employee tag transfer: if any of the merged were tagged, canonical inherits
+        ensure_employees_table()
+        existing_tag = conn.execute(
+            "SELECT name, role FROM employees WHERE person_id = ?", (canonical,)
+        ).fetchone()
+        merged_tag = conn.execute(
+            f"SELECT name, role FROM employees WHERE person_id IN ({placeholders}) "
+            "ORDER BY person_id LIMIT 1",
+            payload.merge_ids,
+        ).fetchone()
+        inherited_tag = None
+        if not existing_tag and merged_tag:
+            conn.execute(
+                "INSERT OR REPLACE INTO employees (person_id, name, role, tagged_via) "
+                "VALUES (?, ?, ?, ?)",
+                (canonical, merged_tag[0], merged_tag[1], "merge"),
+            )
+            inherited_tag = {"name": merged_tag[0], "role": merged_tag[1]}
+        conn.execute(
+            f"DELETE FROM employees WHERE person_id IN ({placeholders})",
+            payload.merge_ids,
+        )
+
+        # Update canonical person's n_samples to sum across all merged (cheap proxy
+        # for "this person has been seen many times now")
+        merged_samples = conn.execute(
+            f"SELECT COALESCE(SUM(n_samples), 0) FROM persons WHERE person_id IN ({placeholders})",
+            payload.merge_ids,
+        ).fetchone()[0]
+        if merged_samples > 0:
+            conn.execute(
+                "UPDATE persons SET n_samples = n_samples + ? WHERE person_id = ?",
+                (merged_samples, canonical),
+            )
+
+        # Finally, delete the merged-away person rows
+        n_p = conn.execute(
+            f"DELETE FROM persons WHERE person_id IN ({placeholders})",
+            payload.merge_ids,
+        ).rowcount
+
+        conn.commit()
+
+    # Schedule pipeline+dashboard restart so the in-memory PersonRegistry
+    # reloads the cleaned DB state. Without this, the pipeline would still
+    # have the deleted persons in memory and re-persist them on next detection.
+    restart_msg = _schedule_oneshot_restart(reason="persons_merge")
+
+    return {
+        "ok": True,
+        "canonical": canonical,
+        "merged_into_canonical": payload.merge_ids,
+        "deleted_persons": n_p,
+        "updated_track_persons": n_tp,
+        "updated_entry_events": n_ee,
+        "inherited_employee_tag": inherited_tag,
+        "restart": restart_msg,
+    }
+
+
 class SettingUpdate(BaseModel):
     value: float
 

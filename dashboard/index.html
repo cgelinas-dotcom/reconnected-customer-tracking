@@ -87,8 +87,17 @@
   </table>
 
   <h2>Persons (cross-camera, re-ID)</h2>
+  <div style="margin-bottom:10px;font-size:12px;color:var(--muted)">
+    <strong>Merging duplicates:</strong> If OSNet split one real person into multiple P numbers,
+    check the boxes next to those rows and click "Merge" below. The lowest-numbered P is kept;
+    all detections, entry events, and employee tags from the others get transferred to it.
+    The pipeline auto-restarts so its in-memory registry reloads the cleaned state.
+  </div>
+  <div style="margin-bottom:10px">
+    <button id="merge-btn" onclick="doMerge()" disabled style="padding:6px 12px;border-radius:6px;border:1px solid #0a66c2;background:#0a66c2;color:white;cursor:pointer;font:inherit;font-size:12px">Merge selected (pick 2+)</button>
+  </div>
   <table id="persons">
-    <thead><tr><th>Person ID</th><th>Status</th><th>First seen</th><th>Last seen</th><th>First store · camera</th><th>Cameras</th><th>Samples</th><th></th></tr></thead>
+    <thead><tr><th style="width:30px"></th><th>Person ID</th><th>Status</th><th>First seen</th><th>Last seen</th><th>First store · camera</th><th>Cameras</th><th>Samples</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
 
@@ -212,22 +221,92 @@
           : '<tr><td colspan="8" class="empty">No visits computed yet — run: python scripts/compute_visits.py</td></tr>';
     }
 
+    // Auto-refresh suppression: when user is interacting with the persons
+    // table (a prompt is open, or merge selections are in progress), block
+    // loadPersons from re-rendering and blowing away their state.
+    let personsRefreshSuppressed = false;
+    let mergeSelected = new Set();
+
     async function toggleEmployee(personId, isCurrentlyEmployee) {
-      if (isCurrentlyEmployee) {
-        await fetch(`/api/employees/${personId}`, {method: 'DELETE'});
-      } else {
-        const name = prompt(`Enter a name for P${personId} (optional, e.g. "Sarah - Manager"):`, '');
-        if (name === null) return;  // cancelled
-        await fetch('/api/employees', {
+      personsRefreshSuppressed = true;
+      try {
+        if (isCurrentlyEmployee) {
+          await fetch(`/api/employees/${personId}`, {method: 'DELETE'});
+        } else {
+          const name = prompt(`Enter a name for P${personId} (optional, e.g. "Sarah - Manager"):`, '');
+          if (name === null) return;  // cancelled
+          const r = await fetch('/api/employees', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({person_id: personId, name: name || null, role: null}),
+          });
+          if (!r.ok) {
+            alert(`Failed to mark employee (HTTP ${r.status}). Try again.`);
+            return;
+          }
+        }
+      } finally {
+        personsRefreshSuppressed = false;
+        await loadPersons();
+      }
+    }
+
+    function toggleMergeSelect(personId, checked) {
+      if (checked) mergeSelected.add(personId);
+      else mergeSelected.delete(personId);
+      const btn = document.getElementById('merge-btn');
+      if (btn) {
+        btn.disabled = mergeSelected.size < 2;
+        btn.textContent = mergeSelected.size < 2
+          ? `Merge selected (pick 2+)`
+          : `Merge ${mergeSelected.size} P numbers into one`;
+      }
+    }
+
+    async function doMerge() {
+      if (mergeSelected.size < 2) return;
+      const ids = [...mergeSelected].sort((a, b) => a - b);
+      const canonical = ids[0];
+      const others = ids.slice(1);
+      const ok = confirm(
+        `Merge these P numbers into P${canonical}?\n\n` +
+        `Canonical (kept): P${canonical}\n` +
+        `Merged away: ${others.map(i => 'P' + i).join(', ')}\n\n` +
+        `All their detections, entry events, and employee tags will be transferred ` +
+        `to P${canonical}. The pipeline + dashboard will restart afterward so the ` +
+        `in-memory registry reloads the cleaned state.\n\nContinue?`
+      );
+      if (!ok) return;
+      personsRefreshSuppressed = true;
+      try {
+        const r = await fetch('/api/persons/merge', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({person_id: personId, name: name || null, role: null}),
+          body: JSON.stringify({canonical_person_id: canonical, merge_ids: others}),
         });
+        const d = await r.json();
+        if (!r.ok) {
+          alert(`Merge failed (HTTP ${r.status}): ${d.detail || JSON.stringify(d)}`);
+          return;
+        }
+        const restartLine = d.restart ? `\nRestart: ${d.restart}` : '';
+        alert(
+          `Merged successfully.\n\n` +
+          `Kept P${d.canonical}\n` +
+          `Deleted ${d.deleted_persons} P numbers\n` +
+          `Updated ${d.updated_track_persons} track→person mappings\n` +
+          `Updated ${d.updated_entry_events} entry events` +
+          restartLine
+        );
+        mergeSelected.clear();
+      } finally {
+        personsRefreshSuppressed = false;
+        await loadPersons();
       }
-      refresh();
     }
 
     async function loadPersons() {
+      if (personsRefreshSuppressed) return;
       const r = await fetch('/api/persons');
       const rows = await r.json();
       document.querySelector('#persons tbody').innerHTML =
@@ -242,9 +321,10 @@
                 : `<span class="badge cust">Customer</span>`;
               const btnLabel = p.is_employee ? 'Unmark' : 'Mark as employee';
               const btnClass = p.is_employee ? 'danger' : '';
-              return `<tr class="${p.is_employee ? 'is-emp' : ''}"><td>P${p.person_id}</td><td>${status}</td><td>${fmtTs(p.first_seen_ts)}</td><td>${fmtTs(p.last_seen_ts)}</td><td>${p.first_store} · ${p.first_camera}</td><td>${p.cameras_seen}</td><td>${p.n_samples}</td><td><button class="${btnClass}" onclick="toggleEmployee(${p.person_id}, ${p.is_employee ? 'true' : 'false'})">${btnLabel}</button></td></tr>`;
+              const isChecked = mergeSelected.has(p.person_id) ? 'checked' : '';
+              return `<tr class="${p.is_employee ? 'is-emp' : ''}"><td><input type="checkbox" ${isChecked} onchange="toggleMergeSelect(${p.person_id}, this.checked)"></td><td>P${p.person_id}</td><td>${status}</td><td>${fmtTs(p.first_seen_ts)}</td><td>${fmtTs(p.last_seen_ts)}</td><td>${p.first_store} · ${p.first_camera}</td><td>${p.cameras_seen}</td><td>${p.n_samples}</td><td><button class="${btnClass}" onclick="toggleEmployee(${p.person_id}, ${p.is_employee ? 'true' : 'false'})">${btnLabel}</button></td></tr>`;
             }).join('')
-          : '<tr><td colspan="8" class="empty">No re-ID data yet — run with REID=1</td></tr>';
+          : '<tr><td colspan="9" class="empty">No re-ID data yet — run with REID=1</td></tr>';
     }
 
     async function loadChart() {
