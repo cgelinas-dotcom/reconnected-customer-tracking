@@ -917,20 +917,43 @@ def admin_live_frame(camera_name: str):
 
 @app.post("/api/admin/restart_pipeline")
 def admin_restart_pipeline():
-    """Stop+start the CustomerTracking_Pipeline scheduled task (Windows only).
-    On Mac/Linux this is a no-op and returns a warning."""
+    """Restart BOTH the pipeline AND the dashboard processes. Same detached
+    PowerShell pattern as admin_git_pull — sleeps 2s so this HTTP response
+    ships first, then kills every python.exe (including this dashboard)
+    and re-runs both scheduled tasks. New dashboard returns in ~5s.
+
+    Restarting the dashboard is necessary whenever src/api/*.py code has
+    changed on disk — Python loads modules at startup, so a stale dashboard
+    process keeps serving old endpoints even after a git pull."""
     import sys
     import subprocess
     if sys.platform != "win32":
         return {"ok": False, "skipped": True, "reason": "not running on Windows"}
-    out: list[str] = []
-    for cmd in (
-        ["schtasks", "/End", "/TN", "CustomerTracking_Pipeline"],
-        ["schtasks", "/Run", "/TN", "CustomerTracking_Pipeline"],
-    ):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        out.append(f"$ {' '.join(cmd)}\n{r.stdout}{r.stderr}")
-    return {"ok": True, "log": "\n".join(out)}
+
+    ps_script = (
+        "Start-Sleep -Seconds 2; "
+        "Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; "
+        "Start-Sleep -Seconds 2; "
+        "schtasks /Run /TN CustomerTracking_Pipeline | Out-Null; "
+        "schtasks /Run /TN CustomerTracking_Dashboard | Out-Null"
+    )
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        return {
+            "ok": True,
+            "log": "Pipeline + dashboard restart scheduled in 2s — both will be back online in ~5s.",
+        }
+    except Exception as e:
+        return {"ok": False, "log": f"Failed to spawn detached restart: {type(e).__name__}: {e}"}
 
 
 @app.get("/api/admin/health")
