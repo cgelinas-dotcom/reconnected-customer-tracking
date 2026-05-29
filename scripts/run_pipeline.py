@@ -371,7 +371,9 @@ def main() -> int:
     # entirely instead of locking in a doorway-edge half-glimpse.
     track_warmup_embeds: dict[int, list] = {}  # tid -> list of embeddings
     track_warmup_colors: dict[int, list] = {}  # tid -> list of color signatures
-    MIN_QUALITY_EMBEDS_FOR_ASSIGN = 3  # average this many before deciding identity
+    MIN_QUALITY_EMBEDS_FOR_ASSIGN = 3   # average this many before first decision
+    MAX_QUALITY_EMBEDS_FOR_WAIT = 8     # if still borderline at this many, force-commit
+    REID_BORDERLINE_NEW_PENALTY = 0.02  # bias toward existing person when totally tied
 
     # Quality crop thresholds — refuse to embed garbage frames.
     QUALITY_MIN_BBOX_HEIGHT = 80         # pixels — anything smaller is too low-detail
@@ -452,37 +454,63 @@ def main() -> int:
                                     csig = color_signature(crop)
 
                                     if is_first_sighting:
-                                        # Multi-shot first embedding: accumulate
-                                        # quality samples until we have enough,
-                                        # then average and decide identity.
+                                        # Multi-shot + active-wait: accumulate
+                                        # quality samples. Evaluate after each
+                                        # crop from #3 onward. Commit when
+                                        # confident; keep waiting if borderline;
+                                        # force-commit when we hit max wait.
                                         track_warmup_embeds.setdefault(tid, []).append(emb)
                                         track_warmup_colors.setdefault(tid, []).append(csig)
-                                        if len(track_warmup_embeds[tid]) >= MIN_QUALITY_EMBEDS_FOR_ASSIGN:
+                                        n_have = len(track_warmup_embeds[tid])
+                                        if n_have >= MIN_QUALITY_EMBEDS_FOR_ASSIGN:
                                             avg_emb = average_embeddings(track_warmup_embeds[tid])
-                                            pid, sim = registry.assign(avg_emb, ts, store_id, camera_id)
-                                            track_to_person[tid] = pid
-                                            db.execute(
-                                                "INSERT OR REPLACE INTO track_persons "
-                                                "(store_id, camera_id, track_id, person_id, match_sim, assigned_ts) "
-                                                "VALUES (?, ?, ?, ?, ?, ?)",
-                                                (store_id, camera_id, tid, pid, sim, ts),
+                                            avg_color = (
+                                                [sum(c) / len(c) for c in zip(*track_warmup_colors[tid])]
+                                                if track_warmup_colors[tid] else None
                                             )
-                                            persist_person(db, registry.persons[pid])
-                                            match_note = (
-                                                f"matched sim={sim:.2f}"
-                                                if sim is not None else "new"
+                                            result = registry.evaluate(avg_emb, ts, avg_color)
+                                            should_commit = (
+                                                result.confidence != "borderline"
+                                                or n_have >= MAX_QUALITY_EMBEDS_FOR_WAIT
                                             )
-                                            n_samples = len(track_warmup_embeds[tid])
-                                            print(f"  [reid] track {tid} -> person {pid} "
-                                                  f"({match_note}, multi-shot from {n_samples} crops)")
-                                            # Free warmup memory now that we've committed
-                                            track_warmup_embeds.pop(tid, None)
-                                            track_warmup_colors.pop(tid, None)
+                                            if should_commit:
+                                                if result.best_pid is not None:
+                                                    registry.commit_match(
+                                                        result.best_pid, avg_emb, ts, avg_color
+                                                    )
+                                                    pid = result.best_pid
+                                                    sim = result.adjusted_sim
+                                                else:
+                                                    pid = registry.commit_new(
+                                                        avg_emb, ts, store_id, camera_id, avg_color
+                                                    )
+                                                    sim = None
+                                                track_to_person[tid] = pid
+                                                db.execute(
+                                                    "INSERT OR REPLACE INTO track_persons "
+                                                    "(store_id, camera_id, track_id, person_id, match_sim, assigned_ts) "
+                                                    "VALUES (?, ?, ?, ?, ?, ?)",
+                                                    (store_id, camera_id, tid, pid, sim, ts),
+                                                )
+                                                persist_person(db, registry.persons[pid])
+                                                match_note = (
+                                                    f"matched sim={sim:.2f}"
+                                                    if sim is not None else "new"
+                                                )
+                                                forced = (
+                                                    " (forced after wait)"
+                                                    if result.confidence == "borderline" else ""
+                                                )
+                                                print(f"  [reid] track {tid} -> person {pid} "
+                                                      f"({match_note}, {n_have}-shot{forced})")
+                                                track_warmup_embeds.pop(tid, None)
+                                                track_warmup_colors.pop(tid, None)
+                                            # else: borderline, keep waiting
                                     else:
                                         # Periodic refresh of an existing assignment
                                         pid = track_to_person[tid]
                                         if pid in registry.persons:
-                                            registry.persons[pid].update(emb, ts)
+                                            registry.persons[pid].update(emb, ts, csig)
                                             persist_person(db, registry.persons[pid])
                     if reid_enabled:
                         pid = track_to_person.get(tid)
